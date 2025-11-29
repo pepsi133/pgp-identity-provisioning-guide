@@ -1,0 +1,42 @@
+MIT License
+
+Copyright (c) 2025 Robert Ryszard Żegleń
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--------------------------------------------------------------------------------
+
+ADDITIONAL NOTICES AND ATTRIBUTIONS
+
+1. DOCUMENTATION SOURCE
+   This manual is a derivative work created for educational and operational 
+   purposes. It is based on official documentation for GnuPG (GPG), YubiKey 
+   (Yubico), and standard Linux utilities. Users are advised to verify 
+   commands against the official vendor documentation for their specific 
+   versions.
+
+2. AI ASSISTANCE
+   This document and the associated scripts were developed with the assistance 
+   of Artificial Intelligence tools (Google Gemini 1.5 Pro and xAI Grok) for 
+   formatting, logic verification, and script optimization.
+
+3. LICENSE COMPATIBILITY
+   Usage and modification of this material are permitted provided that such 
+   usage does not violate the licenses of the underlying tools referenced 
+   herein (including but not limited to GnuPG, OpenSSH, and YubiKey Manager).
