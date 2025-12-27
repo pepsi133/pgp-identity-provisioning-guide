@@ -1,12 +1,17 @@
 # Air-Gapped OpenPGP Root Identity & Hardware Provisioning Protocol
 
-Version: 1.3 (Streamlined for Advanced Users)
-Target System: Debian-based Live Linux ISO (e.g., Ubuntu, Debian, or Kali Live). Note: Scripts tested on Standard Kali Live.
+Version: 1.4 (Debian Stable Live, streamlined for advanced users)
+Target System: Debian Stable Live ISO. All package sourcing is from Debian Main (stable).
+
+External references to keep handy (outside this document, as QR/URL placeholders):
+- GnuPG Manual: https://gnupg.org/documentation/manuals/gnupg/
+- drduh YubiKey/SSH/Git guide: https://github.com/drduh/YubiKey-Guide
+
 Hardware Required:
 
 * 2x **YubiKey 5C NFC** (Tier 2 "Identity" Keys)
-* 1x **USB Flash Drive** (Encrypted Backup Target 1)
-* 1x **SSD/HDD** (Encrypted Backup Target 2)
+* 1x **USB Flash Drive** (Primary backup target)
+* 1x **SSD/HDD** (Secondary backup target)
 * 1x **USB Printer** (Direct connect)
 
 ## **Index**
@@ -25,30 +30,47 @@ Hardware Required:
 
 ## **Phase 0: Environment Preparation**
 
-**Goal:** Verify tools, define variables, and ensure the printer is ready.
+**Goal:** Verify tools, define variables, ready the printer, and lock in Debian Live persistence.
 
-Step 0.1: Define Variables
-Open your terminal. Edit the variables below to match your identity and storage paths. Copy and paste this block into your shell.
+**Step 0.0: Configure Debian Live Persistence (cache only)**
 
-```bash
+If using a persistent Debian Live USB, configure persistence to retain only **/var/cache/apt** and **/var/lib/apt**. Do **NOT** persist **$GNUPGHOME** or **/tmp**.
+
+1. Boot the Debian Stable Live ISO with persistence enabled.
+2. Mount the persistence partition (often **/media/${USER}/persistence**).
+3. Create **persistence.conf** with cache-only entries:
+
+~~~bash
+sudo tee /media/${USER}/persistence/persistence.conf >/dev/null <<'EOF'
+/var/cache/apt union
+/var/lib/apt union
+EOF
+sudo sync
+~~~
+
+4. Reboot to apply. Confirm that **$GNUPGHOME** and **/tmp** are not persistent.
+
+**Step 0.1: Define Variables**
+
+Open a terminal. Edit the variables to match your identity and mount points. Use RAM-based **$GNUPGHOME**.
+
+~~~bash
 # --- USER IDENTITY ---
 export MY_NAME="Test User"
 export MY_EMAIL="testin@test.tst"
-# Optional: Secondary email identity (leave empty if not needed)
-export MY_EMAIL_2="secondary@test.tst"
+export MY_EMAIL_2="secondary@test.tst"   # optional
 
-# --- STORAGE PATHS (Check 'lsblk' or 'df -h' to confirm mount points) ---
-# Ensure your USB/SSD are mounted before running this.
-export USB_BACKUP_PATH="/media/kali/zielony_po_Lucjanku"
-export SSD_BACKUP_PATH="/media/kali/ssd_for_backup"
+# --- STORAGE PATHS (confirm with lsblk/df -h) ---
+export USB_BACKUP_PATH="/media/debian/usb_backup"
+export SSD_BACKUP_PATH="/media/debian/ssd_backup"
 
-# --- SYSTEM CONSTANTS (Do not change) ---
+# --- SYSTEM CONSTANTS (do not change) ---
 export GNUPGHOME=/tmp/tmp.gnupg_dpa_tmp
 export BACKUP_DIR_NAME="PGP_Master_Backup"
-mkdir /tmp/tmp.gnupg_dpa_tmp
+mkdir -p "$GNUPGHOME"
 
-# Save variables to a recovery file (optional but useful)
-cat << EOF > $GNUPGHOME/session_vars.sh
+# Save variables for session recovery
+cat << EOF > "$GNUPGHOME/session_vars.sh"
 export MY_NAME="$MY_NAME"
 export MY_EMAIL="$MY_EMAIL"
 export MY_EMAIL_2="$MY_EMAIL_2"
@@ -59,121 +81,185 @@ EOF
 
 echo "✅ Session variables saved to: $GNUPGHOME/session_vars.sh"
 echo "   To recover after interruption: source $GNUPGHOME/session_vars.sh"
-```
+~~~
 
-Step 0.2: Pre-Flight Tool Check
-Run this snippet to ensure the necessary tools are available and install missing ones.
+**Step 0.2: Pre-Flight Tool Check (Debian Stable Main repos)**
 
-```bash
-# List of required command-line tools (actual executable names)
+All tooling should come from Debian Main. Packages: **gnupg paperkey qrencode zbar-tools coreutils yubikey-manager wamerican scdaemon pcscd cups-client rng-tools**.
+
+~~~bash
 REQUIRED_TOOLS=("gpg" "paperkey" "qrencode" "zbarimg" "zbarcam" "shuf" "sha256sum" "ykman" "lp")
-
-# Corresponding packages that provide these tools
-PACKAGES="gnupg paperkey qrencode zbar-tools coreutils yubikey-manager wamerican scdaemon pcscd cups-client"
+PACKAGES="gnupg paperkey qrencode zbar-tools coreutils yubikey-manager wamerican scdaemon pcscd cups-client rng-tools"
 
 echo ">>> Initial Tool Check..."
-echo "════════════════════════════════════════════════════════════════"
 for tool in "${REQUIRED_TOOLS[@]}"; do
-    if command -v "$tool" &> /dev/null; then
-        echo "  ✅ $tool"
-    else
-        echo "  ❌ $tool (missing)"
-    fi
+  command -v "$tool" >/dev/null && echo "  ✅ $tool" || echo "  ❌ $tool (missing)"
 done
-echo "════════════════════════════════════════════════════════════════"
-echo ""
 
-# Check network connectivity before attempting installation
 echo ">>> Checking Internet Connectivity..."
-if ping -c 1 -W 2 8.8.8.8 &> /dev/null; then
-    echo "✅ Internet connected."
-    NETWORK_OK=1
+if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
+  echo "✅ Internet connected."; NETWORK_OK=1
 else
-    echo "❌ No internet. Skipping installation."
-    NETWORK_OK=0
+  echo "❌ No internet. Skipping installation."; NETWORK_OK=0
 fi
+
 echo ""
-
-# Only attempt installation if network is available
 if [ $NETWORK_OK -eq 1 ]; then
-    # Fix Kali Live repository (often broken or pointing to cdrom)
-    if ! grep -q "http.*kali.org/kali" /etc/apt/sources.list 2>/dev/null; then
-        echo ">>> Adding standard Kali repository..."
-        echo "deb http://http.kali.org/kali kali-rolling main non-free contrib" | sudo tee -a /etc/apt/sources.list
-    fi
-
-    # Update and install (tolerate errors - Live systems can be flaky)
-    echo ">>> Running apt-get update..."
-    sudo apt-get update || true
-    echo ""
-
-    echo ">>> Installing packages..."
-    sudo apt-get install -y $PACKAGES || sudo apt-get install -y --fix-missing $PACKAGES || true
-    echo ""
+  echo ">>> Updating Debian Main repos..."
+  sudo apt-get update || true
+  echo ""
+  echo ">>> Installing packages..."
+  sudo apt-get install -y $PACKAGES || sudo apt-get install -y --fix-missing $PACKAGES || true
+  echo ""
 fi
 
-# Start pcscd service (required for YubiKey)
 echo ">>> Starting pcscd service..."
 sudo systemctl unmask pcscd || true
 sudo systemctl start pcscd || true
-echo ""
 
 # Final verification
-echo ">>> Final Tool Check..."
-echo "════════════════════════════════════════════════════════════════"
 MISSING_COUNT=0
 for tool in "${REQUIRED_TOOLS[@]}"; do
-    if command -v "$tool" &> /dev/null; then
-        echo "  ✅ $tool"
-    else
-        echo "  ❌ $tool (missing)"
-        MISSING_COUNT=$((MISSING_COUNT + 1))
-    fi
+  if command -v "$tool" >/dev/null; then
+    echo "  ✅ $tool"
+  else
+    echo "  ❌ $tool (missing)"; MISSING_COUNT=$((MISSING_COUNT + 1))
+  fi
 done
-echo "════════════════════════════════════════════════════════════════"
-echo ""
+[ $MISSING_COUNT -gt 0 ] && echo "⚠️  $MISSING_COUNT tool(s) missing. Install manually: sudo apt-get install -y <package>" || echo "✅ All tools available."
+~~~
 
-if [ $MISSING_COUNT -gt 0 ]; then
-    echo "⚠️  $MISSING_COUNT tool(s) missing. Install manually: sudo apt-get install -y <package>"
-else
-    echo "✅ All tools available."
-fi
-```
+**Step 0.2 (Optional): Offline Bundle for Air-Gap Injection**
+
+On a separate online Debian Stable machine:
+
+~~~bash
+# Create a local pool of .deb files for required packages
+mkdir -p /tmp/pgp_bundle && cd /tmp/pgp_bundle
+apt-get update
+apt-get download gnupg paperkey qrencode zbar-tools coreutils yubikey-manager wamerican scdaemon pcscd cups-client rng-tools
+ls -lh
+~~~
+
+Copy the directory to your air-gapped media. On the air-gapped Debian Live system, install with:
+
+~~~bash
+cd /path/to/pgp_bundle
+sudo dpkg -i *.deb || { echo "⚠️ dpkg reported errors; attempting apt-get -f install..."; sudo apt-get -f install -y || echo "❌ Offline bundle install failed; review errors above."; }
+~~~
 
 **Step 0.3: Printer Setup (Network Required)**
 
-* **Action:** Ensure you are still connected to the internet.
-* **Action:** Open the System Settings -> Printers. Add your USB printer.
-* **Why:** Linux may need to download drivers or CUPS dependencies to initialize the printer.
-* **Verify:** Print a test page now to confirm functionality before disconnecting.
+* Add the USB printer via Settings → Printers while online so CUPS pulls dependencies.
+* Print a test page before disconnecting.
 
-Step 0.4: Establish Air-Gap (CRITICAL)
-* **Action:** Physically disconnect the Ethernet cable or disable the Wi-Fi adapter.
-* **Verify:** Run the following command to ensure isolation:
+**Step 0.4 (Optional but Recommended, Network OK): Diagnostic QR Test (Dummy Loopback)**
 
-```bash
-echo ">>> Verifying Air-Gap Status..."
-if ip route get 8.8.8.8 &>/dev/null; then
-    echo "❌ CRITICAL: Default route exists. Network may still be reachable."
-    ip route show
-elif ping -c 1 -W 1 8.8.8.8 &>/dev/null; then
-    echo "❌ CRITICAL: Ping succeeded. Network is reachable."
-else
-    echo "✅ Air-gap verified: Network is unreachable"
+Goal: Prove **zbarcam** and **paperkey** work with your camera/printer before any secrets or passphrases are generated. Do this while network is available so you can troubleshoot drivers if needed.
+
+~~~bash
+# Use an isolated temp GNUPGHOME for the dummy key
+export GNUPGHOME_DIAG=/tmp/tmp.gnupg_diag
+mkdir -p "$GNUPGHOME_DIAG"
+
+gpg --homedir "$GNUPGHOME_DIAG" --quick-generate-key "QR Test <qr-test@example.com>" ed25519 default 1d
+DUMMY_KEYID=$(gpg --homedir "$GNUPGHOME_DIAG" --list-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')
+
+gpg --homedir "$GNUPGHOME_DIAG" --export-secret-key "$DUMMY_KEYID" > "$GNUPGHOME_DIAG/dummy_secret.gpg"
+paperkey --secret-key "$GNUPGHOME_DIAG/dummy_secret.gpg" --output "$GNUPGHOME_DIAG/dummy_paperkey.txt"
+cat "$GNUPGHOME_DIAG/dummy_paperkey.txt" | qrencode -l M -o "$GNUPGHOME_DIAG/dummy_qr.png"
+
+# Print and scan to mobile (OpenKeychain or similar) to confirm end-to-end
+lp "$GNUPGHOME_DIAG/dummy_qr.png"
+
+# Desktop reconstruction sanity check (requires an actual camera scan for full test)
+command -v zbarcam >/dev/null && echo "✅ zbarcam available" || echo "❌ zbarcam not found"
+paperkey --pubring <(gpg --homedir "$GNUPGHOME_DIAG" --export "$DUMMY_KEYID") --secrets "$GNUPGHOME_DIAG/dummy_paperkey.txt" --output "$GNUPGHOME_DIAG/dummy_rebuild.gpg"
+sha256sum "$GNUPGHOME_DIAG/dummy_secret.gpg" "$GNUPGHOME_DIAG/dummy_rebuild.gpg"
+
+# Cleanup
+rm -rf "$GNUPGHOME_DIAG"
+unset GNUPGHOME_DIAG
+~~~
+
+If the dummy key fails to round-trip on mobile or desktop, fix scanning/printing before proceeding.
+
+**Step 0.5 (Optional but Recommended, Network OK): YubiKey Dry-Run Diagnostic**
+
+Goal: Validate YubiKey detection, CCID mode, touch policy, and keytocard workflow with a disposable test key before touching real identities. Run this while network is available for driver troubleshooting. This will wipe the YubiKey OpenPGP applet when reset—perform on each YubiKey and run `ykman openpgp reset -f` afterward to return it to a clean state before Phase 6/7.
+
+~~~bash
+export GNUPGHOME_YK_DIAG=/tmp/tmp.gnupg_yk_diag
+mkdir -p "$GNUPGHOME_YK_DIAG"
+
+gpg --homedir "$GNUPGHOME_YK_DIAG" --quick-generate-key "YubiKey Test <yk-test@example.com>" ed25519 default 1d
+YK_TEST_KEYID=$(gpg --homedir "$GNUPGHOME_YK_DIAG" --list-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')
+
+gpg --card-status | grep -q "OpenPGP card" && echo "✅ YubiKey detected" || echo "❌ CRITICAL: YubiKey not detected"
+
+# Ensure CCID-only and touch policies are configurable
+ykman config mode ccid || true
+gpgconf --kill gpg-agent
+gpg --card-status | grep -q "OpenPGP card" && echo "✅ CCID mode OK" || echo "⚠️  CCID check: investigate"
+ykman openpgp keys set-touch sig ON || true
+ykman openpgp keys set-touch aut ON || true
+ykman openpgp keys set-touch enc ON || true
+
+# Load dummy key to card (exercises keytocard flow)
+cat << 'EOF'
+At the gpg> prompt (dummy key):
+- key 1 → keytocard → 1 (Signature) → Admin PIN → key 1 (deselect)
+- key 2 → keytocard → 2 (Encryption) → Admin PIN → key 2 (deselect)
+- key 3 → keytocard → 3 (Authentication) → Admin PIN
+- save
+EOF
+read -p "Proceed with dummy keytocard? Type YES to continue: " YK_DRYRUN
+if [ "$YK_DRYRUN" = "YES" ]; then
+  gpg --homedir "$GNUPGHOME_YK_DIAG" --edit-key "$YK_TEST_KEYID"
+  gpgconf --kill gpg-agent; sleep 2
+  gpg --card-status | grep -q "Signature key" && echo "✅ Dummy signature key detected on card" || echo "⚠️  Dummy signature key not detected"
 fi
-```
 
-* **Warning:** Do not reconnect to the internet for the remainder of this session.
+ykman openpgp reset -f  # wipe dummy data; required before real provisioning
+rm -rf "$GNUPGHOME_YK_DIAG"
+unset GNUPGHOME_YK_DIAG
+~~~
+
+If any YubiKey step fails, resolve hardware/driver issues now while online if needed. Restart Phase 0 after resetting the YubiKey.
+
+**Step 0.6: Establish Air-Gap (CRITICAL)**
+
+~~~bash
+echo ">>> Verifying Air-Gap Status..."
+if ip route get 8.8.8.8 >/dev/null 2>&1; then
+  echo "❌ CRITICAL: Default route exists. Network may still be reachable."; ip route show
+elif ping -c 1 -W 1 8.8.8.8 >/dev/null 2>&1; then
+  echo "❌ CRITICAL: Ping succeeded. Network is reachable."
+else
+  echo "✅ Air-gap verified: Network is unreachable"
+fi
+~~~
 
 ## **Phase 1: Secure Session Setup**
 
-**Goal:** Create a hardened, RAM-based GPG environment.
+**Goal:** Harden the GPG environment in RAM and prepare entropy.
 
-Step 1.1: Harden GPG Configuration
-Apply strong crypto preferences and S2K (String-to-Key) hardening.
+**Step 1.0: Entropy Hardening (run before key generation)**
 
-```bash
-cat << EOF > $GNUPGHOME/gpg.conf
+Ensure **rng-tools** is running and feed manual salt into the kernel pool.
+
+~~~bash
+# Start rngd if not already active
+sudo systemctl enable --now rng-tools || sudo rngd -r /dev/urandom -o /dev/random -b
+
+echo "Type random characters and move the mouse for 30 seconds, then press Ctrl+D"
+sudo tee /dev/urandom >/dev/null
+~~~
+
+**Step 1.1: Harden GPG Configuration**
+
+~~~bash
+cat << EOF > "$GNUPGHOME/gpg.conf"
 personal-cipher-preferences AES256 AES192 AES
 personal-digest-preferences SHA512 SHA384 SHA256
 personal-compress-preferences ZLIB BZIP2 ZIP Uncompressed
@@ -184,314 +270,194 @@ s2k-cipher-algo AES256
 s2k-count 65011712
 EOF
 
-# Configure agent to prevent cache timeouts during this long session
-echo "default-cache-ttl 7200" > $GNUPGHOME/gpg-agent.conf
-echo "max-cache-ttl 7200" >> $GNUPGHOME/gpg-agent.conf
+echo "default-cache-ttl 7200" > "$GNUPGHOME/gpg-agent.conf"
+echo "max-cache-ttl 7200" >> "$GNUPGHOME/gpg-agent.conf"
 gpg-connect-agent reloadagent /bye
-```
+~~~
 
-Step 1.2: Generate Master Passphrase
-Do not invent a password. Let the entropy pool do it.
+**Step 1.2: Generate Master Passphrase**
 
-```bash
+~~~bash
 echo "------------------------------------------------"
 echo "WRITE THIS DOWN (Your Master Key Passphrase):"
 echo "------------------------------------------------"
 shuf -n 6 /usr/share/dict/words | tr '\n' ' '
 echo -e "\n------------------------------------------------"
-```
+~~~
 
-* **Action:** Write these 6 words on your permanent paper storage card.
-* **Verify:** Read it aloud to yourself.
+Write the 6 words on your permanent paper storage card. Immediately re-type the 6 words exactly as written (silent, no clipboard) to confirm legibility; correct any mistakes on paper before moving on.
 
 ## **Phase 2: Master Key Generation**
 
-**Goal:** Create the "Certify" (C) only Master Key using Ed25519.
+**Goal:** Create the Certify-only Ed25519 master key.
 
 **Step 2.1: Generate Key**
 
-```bash
+Ensure **Step 1.0** entropy hardening was completed immediately before this.
+
+~~~bash
 gpg --expert --full-gen-key
-```
+~~~
 
-**Interactive Selections:**
-
-1. **Key type:** (11) ECC (set your own capabilities)
-2. **Elliptic Curve:** (1) Curve 25519
-3. **Key Usage:**
-   * *Default is Sign & Certify. We want Certify ONLY.*
-   * Toggle Sign: Type `s` \[Enter\]
-   * Toggle Encrypt: Type `e` \[Enter\]
-   * *Check:* Current allowed actions: Certify
-   * Finish: Type `q` \[Enter\]
-4. **Validity:** 0 (Key does not expire).
-5. **Confirm:** y
-6. **ID:** Type the actual values defined in Phase 0 (e.g., 'FirstName...'). Do not type the literal variable name $MY_NAME.
-7. **Passphrase:** Enter the 6 words from Phase 1.
+Interactive selections (unchanged):
+1. Key type: (11) ECC (set your own capabilities)
+2. Elliptic Curve: (1) Curve 25519
+3. Key Usage: toggle Sign (`s`) OFF, toggle Encrypt (`e`) OFF, Certify only → `q`
+4. Validity: 0 (no expiry)
+5. Confirm: y
+6. ID: Type **$MY_NAME** / **$MY_EMAIL** values (not literal variable names)
+7. Passphrase: use the 6-word passphrase from Phase 1
 
 **Step 2.2: Capture Key ID**
 
-```bash
+~~~bash
 export KEYID=$(gpg --list-keys --with-colons | awk -F: '/^fpr:/ { print $10; exit }')
 echo "Key ID Generated: $KEYID"
 
-# Verify key was created successfully
 gpg --list-secret-keys "$KEYID" && echo "✅ Master key verified: $KEYID" || echo "❌ WARNING: Master key not found"
-```
+~~~
 
 **Step 2.3: Add Secondary Identity (Optional)**
 
-```bash
-# Check if secondary email is configured
+~~~bash
 if [ -n "$MY_EMAIL_2" ]; then
-    echo ">>> Adding secondary identity: $MY_EMAIL_2"
-    gpg --quick-add-uid "$KEYID" "$MY_EMAIL_2"
-    
-    # Verify the new UID was added
-    gpg --list-keys "$KEYID" | grep -q "$MY_EMAIL_2" && echo "✅ Secondary identity added" || echo "❌ WARNING: Secondary identity not found"
+  echo ">>> Adding secondary identity: $MY_EMAIL_2"
+  gpg --quick-add-uid "$KEYID" "$MY_EMAIL_2"
+  gpg --list-keys "$KEYID" | grep -q "$MY_EMAIL_2" && echo "✅ Secondary identity added" || echo "❌ WARNING: Secondary identity not found"
+else
+  echo ">>> Secondary identity skipped (MY_EMAIL_2 is empty)"
 fi
 
-# Set trust to ultimate (applies to all UIDs on the key)
 echo ">>> Attempting to set trust to ultimate..."
 echo -e "5\ny\n" | gpg --command-fd 0 --edit-key "$KEYID" trust quit
 
-echo ""
-echo "If automatic trust setting failed, set it manually:"
-echo "  gpg --edit-key $KEYID"
-echo "  > trust"
-echo "  > 5"
-echo "  > y"
-echo "  > quit"
-echo ""
+echo "If automatic trust failed, set it manually via gpg --edit-key $KEYID (trust → 5 → y → quit)."
 
-# Display key with all identities (trust level will be visible)
 echo ">>> Current key structure (verify trust shows [ultimate]):"
 gpg --list-keys "$KEYID"
-echo ""
-```
+~~~
 
 ## **Phase 3: Physical & Digital Backups (Including Revocation)**
 
-**Goal:** Create the "Triple Redundancy" backup and export the critical Revocation Certificate.
+**Goal:** Create the triple redundancy backup and export the revocation certificate.
 
 **Step 3.1: Generate Backup Artifacts**
 
-```bash
-cd $GNUPGHOME
+~~~bash
+cd "$GNUPGHOME"
 
-# 1. Export Secret Key
-gpg --export-secret-key $KEYID > master_secret.gpg
+gpg --export-secret-key "$KEYID" > master_secret.gpg
 
-# 2. Generate Revocation Certificate (CRITICAL STEP - Interactive Prompts Expected)
-# This is your "break glass" file if you lose the master key.
-echo ">>> Generating Revocation Certificate (You will be prompted)..."
-echo "    Reason: Select '0' (No reason specified)"
-echo "    Description: Type 'Backup Revocation' or leave blank"
-echo "    Confirm: Type 'y'"
-gpg --gen-revoke $KEYID > revocation_cert.asc
+echo ">>> Generating Revocation Certificate (interactive)..."
+echo "    Reason: 0 (No reason specified)"
+echo "    Description: 'Backup Revocation' or blank"
+echo "    Confirm: y"
+gpg --gen-revoke "$KEYID" > revocation_cert.asc
 
-# Verify file was created
 ls -lh revocation_cert.asc
 
-# 3. Create Paperkey (Human/OCR readable text)
 paperkey --secret-key master_secret.gpg --output master_paperkey.txt
-
-# 4. Create Checksum (Critical for verification)
 sha256sum master_secret.gpg > master_checksum.txt
-
-# 5. Generate QR Codes (Using Medium error correction for better scan reliability)
 cat master_checksum.txt | qrencode -l M -o checksum_qr.png
 cat revocation_cert.asc | qrencode -l M -o revocation_qr.png
 
-# Verify all artifacts were created
 ls -lh master_secret.gpg revocation_cert.asc master_paperkey.txt master_checksum.txt checksum_qr.png revocation_qr.png
-```
+~~~
 
 **Step 3.2: Print Paper Backups**
 
-```bash
-echo ">>> Printing Paper Backups (QR Codes + Raw ASCII for fallback)..."
+~~~bash
+echo ">>> Printing Paper Backups (QR Codes + ASCII)..."
 
-# Print QR codes
 lp checksum_qr.png
 lp revocation_qr.png
-
-# Print raw ASCII files (fallback if QR scanning fails later)
 lp master_checksum.txt
 lp revocation_cert.asc
 lp master_paperkey.txt
 
-echo "✅ Paper backups printed. Store in secure location."
-```
+echo "✅ Paper backups printed. Store securely."
+~~~
 
-**Step 3.3: Verification Tests**
+**Step 3.3: QR Scan Verification (Printed Media)**
 
-**Part A: QR Code Scan Verification (CRITICAL - Do This First)**
-
-Test that printed QR codes are actually scannable before proceeding. If they're too dense or printer quality is poor, you'll discover it now, not during emergency recovery.
-
-```bash
-echo ""
-echo "═══════════════════════════════════════════════════════════════"
-echo "⚠️  CRITICAL: QR CODE SCAN TEST"
-echo "═══════════════════════════════════════════════════════════════"
-echo "We must verify the printed QR codes are scannable NOW."
-echo "If scanning fails, you have time to:"
-echo "  - Adjust QR error correction level (try -l H for high)"
-echo "  - Use a different printer"
-echo "  - Split large QR codes into smaller chunks"
-echo "  - Rely on raw ASCII printouts instead"
-echo ""
-echo "Testing THREE QR codes: Checksum, Revocation, and Master Paperkey"
-echo "═══════════════════════════════════════════════════════════════"
-echo ""
-
-# Test 1: Checksum QR
-echo ">>> TEST 1/3: Scan the CHECKSUM QR code (small, should be easy)"
-echo "    Hold printed checksum_qr.png to camera. Press Ctrl+C if it fails."
+~~~bash
+echo ">>> TEST 1/2: Scan the CHECKSUM QR code"
 zbarcam --raw > scanned_checksum.txt 2>/dev/null
-
-if diff -w master_checksum.txt scanned_checksum.txt > /dev/null 2>&1; then
-    echo "✅ Checksum QR scan successful"
+if diff -w master_checksum.txt scanned_checksum.txt >/dev/null 2>&1; then
+  echo "✅ Checksum QR scan successful"
 else
-    echo "❌ WARNING: Checksum QR scan failed or doesn't match"
-    echo "    You can manually type from printed master_checksum.txt if needed"
+  echo "❌ WARNING: Checksum QR scan failed or mismatch"
 fi
 rm -f scanned_checksum.txt
 
-# Test 2: Revocation Certificate QR
-echo ""
-echo ">>> TEST 2/3: Scan the REVOCATION CERTIFICATE QR code"
-echo "    This may be large. Hold printed revocation_qr.png to camera."
+echo ">>> TEST 2/2: Scan the REVOCATION CERTIFICATE QR code"
 zbarcam --raw > scanned_revocation.txt 2>/dev/null
-
-if diff -w revocation_cert.asc scanned_revocation.txt > /dev/null 2>&1; then
-    echo "✅ Revocation Certificate QR scan successful"
+if diff -w revocation_cert.asc scanned_revocation.txt >/dev/null 2>&1; then
+  echo "✅ Revocation Certificate QR scan successful"
 else
-    echo "❌ WARNING: Revocation QR scan failed or doesn't match"
-    echo "    You can use printed revocation_cert.asc (raw ASCII) instead"
+  echo "❌ WARNING: Revocation QR scan failed or mismatch"
 fi
 rm -f scanned_revocation.txt
+~~~
 
-# Test 3: Master Paperkey QR (if generated)
-# Note: This test will be repeated in Phase 5.5 after subkeys are added
-echo ""
-echo ">>> Skipping Master Paperkey QR test for now (will test in Phase 5.5)"
-echo "    After subkeys are added, we'll regenerate and test it."
-echo ""
-echo "✅ QR Code scan verification complete"
-echo "   If any scans failed, you still have raw ASCII printouts as backup."
-echo ""
-read -p "Press Enter to continue to digital verification tests..."
-```
+**Step 3.4: Digital Integrity Check (Master Key)**
 
-**Part B: Digital Check (Master Key)**
-
-Verify that the paperkey backup matches the master secret key purely in software.
-
-```bash
-# Need public key to reconstruct secret for verification
-gpg --export $KEYID > pubkey_test.gpg
-
-# Reconstruct secret key from paperkey text
+~~~bash
+gpg --export "$KEYID" > pubkey_test.gpg
 paperkey --pubring pubkey_test.gpg --secrets master_paperkey.txt --output test_secret.gpg
-
-# Compare Checksums
 HASH_ORIG=$(sha256sum master_secret.gpg | awk '{print $1}')
 HASH_RECONSTRUCT=$(sha256sum test_secret.gpg | awk '{print $1}')
-
 echo "Original:      $HASH_ORIG"
 echo "Reconstructed: $HASH_RECONSTRUCT"
-
 [ "$HASH_ORIG" == "$HASH_RECONSTRUCT" ] && echo "✅ DIGITAL CHECK PASSED" || echo "❌ FAILURE: Hashes don't match"
-
-# Clean up temporary test files
 rm -f pubkey_test.gpg test_secret.gpg
-```
+~~~
 
-**Part C: Additional Integrity Checks**
+**Step 3.5: Additional Integrity Checks**
 
-Generate and verify checksums for all backup artifacts.
-
-```bash
+~~~bash
 echo ">>> Generating comprehensive checksums for all backup files..."
 sha256sum revocation_cert.asc master_paperkey.txt >> master_checksum.txt
+~~~
 
-echo ">>> All verification tests complete."
-echo "    Proceed to backup storage (Step 3.4)"
-```
+**Step 3.6: Save to USB & SSD**
 
-**Step 3.4: Save to USB & SSD**
-
-```bash
-# Create Folders
-mkdir -p "$USB_BACKUP_PATH/$BACKUP_DIR_NAME"
-mkdir -p "$SSD_BACKUP_PATH/$BACKUP_DIR_NAME"
-
-# Copy files
+~~~bash
+mkdir -p "$USB_BACKUP_PATH/$BACKUP_DIR_NAME" "$SSD_BACKUP_PATH/$BACKUP_DIR_NAME"
 for FILE in master_secret.gpg revocation_cert.asc master_checksum.txt master_paperkey.txt gpg.conf gpg-agent.conf; do
-    cp "$FILE" "$USB_BACKUP_PATH/$BACKUP_DIR_NAME/"
-    cp "$FILE" "$SSD_BACKUP_PATH/$BACKUP_DIR_NAME/"
+  cp "$FILE" "$USB_BACKUP_PATH/$BACKUP_DIR_NAME/"
+  cp "$FILE" "$SSD_BACKUP_PATH/$BACKUP_DIR_NAME/"
 done
-
 sync
 
-# Verify backup contents (manual inspection)
-echo ">>> USB Backup Contents:"
 ls -lh "$USB_BACKUP_PATH/$BACKUP_DIR_NAME"
-echo ""
-echo ">>> SSD Backup Contents:"
 ls -lh "$SSD_BACKUP_PATH/$BACKUP_DIR_NAME"
-echo ""
-echo "⚠️  MANUAL CHECK: Ensure all files above match the expected list."
-echo ""
-echo "⚠️  MANUAL CHECK: Ensure all files above match the expected list."
-
-echo ""
-echo "✅ Master backup completed - essential files copied to both USB and SSD."
-echo "📁 Master backup contents and purpose:"
-echo "   🔑 master_secret.gpg - Exported master secret key (ESSENTIAL for restoration)"
-echo "   🚨 revocation_cert.asc - Emergency revocation certificate (ESSENTIAL for key revocation)"
-echo "   ✅ master_checksum.txt - SHA256 checksum for integrity verification (ESSENTIAL)"
-echo "   📄 master_paperkey.txt - Human-readable text backup (can recreate master_secret.gpg)"
-echo "   ⚙️  GPG configs - gpg.conf and gpg-agent.conf (hardened security preferences)"
-echo ""
-echo "Note: QR codes are generated and printed for paper backup only (not stored digitally)"
-echo "Note: public_key_bundle.asc and WKD files will be created in Phase 5"
-```
+~~~
 
 ## **Phase 4: The "Clean Slate" Restoration Test**
 
-**Goal:** Prove that the digital backup actually works by destroying the local key and restoring it.
+**Goal:** Prove the backup works by wiping local keys and restoring.
 
 **Step 4.1: Wipe Local GPG Home**
 
-```bash
-rm -rf $GNUPGHOME/private-keys-v1.d
-rm $GNUPGHOME/pubring.kbx $GNUPGHOME/trustdb.gpg
+~~~bash
+rm -rf "$GNUPGHOME/private-keys-v1.d"
+rm "$GNUPGHOME/pubring.kbx" "$GNUPGHOME/trustdb.gpg"
 echo "Local keys wiped."
-```
+~~~
 
 **Step 4.2: Restore from USB**
 
-```bash
-# Import master key from backup
+~~~bash
 gpg --import "$USB_BACKUP_PATH/$BACKUP_DIR_NAME/master_secret.gpg"
 
-# Set trust to Ultimate (Interactive)
-echo ">>> Setting key trust level (You will be prompted):"
-echo "    1. Type: trust"
-echo "    2. Select: 5 (Ultimate)"
-echo "    3. Confirm: y"
-echo "    4. Exit: quit"
-gpg --edit-key $KEYID
+echo ">>> Setting key trust level (interactive):"
+echo "    trust → 5 (Ultimate) → y → quit"
+gpg --edit-key "$KEYID"
 
-# Verify trust was set
-gpg --list-keys $KEYID | grep -E "^uid.*\[ultimate\]" && echo "✅ Trust level verified: Ultimate" || echo "⚠️  Trust level check: Review output above"
-
-# Verify Import
-gpg --list-secret-keys $KEYID | grep -q "sec" && echo "✅ RESTORE SUCCESS: Master key operational." || echo "❌ FAILURE: Could not import from USB."
-```
+gpg --list-keys "$KEYID" | grep -E "^uid.*\[ultimate\]" && echo "✅ Trust level verified: Ultimate" || echo "⚠️  Trust level check: Review output above"
+gpg --list-secret-keys "$KEYID" | grep -q "sec" && echo "✅ RESTORE SUCCESS: Master key operational." || echo "❌ FAILURE: Could not import from USB."
+~~~
 
 ## **Phase 5: Subkey Generation**
 
@@ -499,786 +465,392 @@ gpg --list-secret-keys $KEYID | grep -q "sec" && echo "✅ RESTORE SUCCESS: Mast
 
 **Step 5.1: Create Subkeys**
 
-```bash
-gpg --expert --edit-key $KEYID
-```
+~~~bash
+gpg --expert --edit-key "$KEYID"
+~~~
 
-*At the gpg> prompt:*
+At the `gpg>` prompt:
+1. Signing Subkey: `addkey` → (10) ECC (sign only) → Curve 25519 → Expiry 1y → save
+2. Encryption Subkey: `addkey` → (12) ECC (encrypt only) → Curve 25519 → Expiry 1y → save
+3. Authentication Subkey: `addkey` → (11) ECC (set your own capabilities) → toggle Sign off (`s`), toggle Auth on (`a`), `q` → Curve 25519 → Expiry 1y → save
 
-1. **Signing Subkey:**
-   * `addkey` -> (10) ECC (sign only) -> Curve 25519 -> Expiry: 1y -> save
-   * *Re-enter:* `gpg --expert --edit-key $KEYID`
-2. **Encryption Subkey:**
-   * `addkey` -> (12) ECC (encrypt only) -> Curve 25519 -> Expiry: 1y -> save
-   * *Re-enter:* `gpg --expert --edit-key $KEYID`
-3. **Authentication Subkey:**
-   * `addkey` -> (11) ECC (set your own capabilities)
-   * Toggle Sign `s` (OFF)
-   * Toggle Auth `a` (ON)
-   * Finish `q` -> Curve 25519 -> Expiry: 1y -> save
+**Step 5.2: WKD Hash Calculation & Export**
 
-Step 5.2: WKD Hash Calculation & Export
+~~~bash
+cd "$GNUPGHOME"
 
-We calculate the WKD filenames for primary and secondary emails now so you don't have to do it later.
+gpg --export "$KEYID" --armor > public_key_bundle.asc
 
-```bash
-cd $GNUPGHOME
-
-# 1. Export Public Bundle (ASCII Armored) - For GitHub/Keyservers
-gpg --export $KEYID --armor > public_key_bundle.asc
-
-# 2. Extract Primary WKD Hash Automatically
 echo ">>> Extracting WKD hash for: $MY_EMAIL"
 WKD_HASH=$(gpg --with-wkd-hash --list-keys "$MY_EMAIL" | grep -A1 "$MY_EMAIL" | grep -v "@" | awk '{print $1}')
-
 if [ -z "$WKD_HASH" ]; then
-    echo "❌ CRITICAL: Automatic WKD hash extraction failed for $MY_EMAIL"
-    echo "    Manual extraction required. Run the following command and observe the output:"
-    echo ""
-    gpg --with-wkd-hash --list-keys "$MY_EMAIL"
-    echo ""
-    echo "    Find the 32-character hash string under '$MY_EMAIL' (looks like: z4y9cea8...)"
-    read -p "    Paste the PRIMARY WKD hash here: " WKD_HASH
-    
-    # Verify user provided a value
-    if [ -z "$WKD_HASH" ]; then
-        echo "❌ CRITICAL: No WKD hash provided. Cannot proceed."
-        echo "    Set manually: export WKD_HASH=\"your_hash_here\""
-    fi
+  echo "❌ CRITICAL: Automatic WKD hash extraction failed for $MY_EMAIL"
+  gpg --with-wkd-hash --list-keys "$MY_EMAIL"
+  read -p "Paste the PRIMARY WKD hash here: " WKD_HASH
 fi
 
-# Verify hash was captured (either automatically or manually)
 if [ -n "$WKD_HASH" ]; then
-    echo "✅ Primary WKD Hash: $WKD_HASH"
-    gpg --export $KEYID > "$WKD_HASH"
-    
-    # Verify file was created
-    [ -f "$WKD_HASH" ] && echo "✅ Primary WKD binary file created" || echo "❌ CRITICAL: Failed to create WKD file '$WKD_HASH'"
+  echo "✅ Primary WKD Hash: $WKD_HASH"
+  gpg --export "$KEYID" > "$WKD_HASH"
+  [ -f "$WKD_HASH" ] && echo "✅ Primary WKD binary file created" || echo "❌ CRITICAL: Failed to create WKD file '$WKD_HASH'"
 fi
 
-# 3. Handle Secondary Email (if configured)
 if [ -n "$MY_EMAIL_2" ]; then
-    echo ""
-    echo ">>> Extracting WKD hash for: $MY_EMAIL_2"
-    WKD_HASH_2=$(gpg --with-wkd-hash --list-keys "$MY_EMAIL_2" | grep -A1 "$MY_EMAIL_2" | grep -v "@" | awk '{print $1}')
-
-    if [ -z "$WKD_HASH_2" ]; then
-        echo "❌ WARNING: Automatic WKD hash extraction failed for $MY_EMAIL_2"
-        echo "    Manual extraction required. Run the following command and observe the output:"
-        echo ""
-        gpg --with-wkd-hash --list-keys "$MY_EMAIL_2"
-        echo ""
-        echo "    Find the 32-character hash string under '$MY_EMAIL_2' (looks like: z4y9cea8...)"
-        read -p "    Paste the SECONDARY WKD hash here (or press Enter to skip): " WKD_HASH_2
-        
-        # User can skip secondary email if they want
-        if [ -z "$WKD_HASH_2" ]; then
-            echo "⚠️  WARNING: Secondary WKD hash not provided. Skipping."
-            echo "    To set later: export WKD_HASH_2=\"your_hash_here\""
-        fi
-    fi
-
-    # Create secondary WKD file only if hash was captured
-    if [ -n "$WKD_HASH_2" ]; then
-        echo "✅ Secondary WKD Hash: $WKD_HASH_2"
-        gpg --export $KEYID > "$WKD_HASH_2"
-        
-        # Verify file was created
-        [ -f "$WKD_HASH_2" ] && echo "✅ Secondary WKD binary file created" || echo "❌ WARNING: Failed to create WKD file '$WKD_HASH_2'"
-    fi
+  echo ">>> Extracting WKD hash for: $MY_EMAIL_2"
+  WKD_HASH_2=$(gpg --with-wkd-hash --list-keys "$MY_EMAIL_2" | grep -A1 "$MY_EMAIL_2" | grep -v "@" | awk '{print $1}')
+  if [ -z "$WKD_HASH_2" ]; then
+    echo "❌ WARNING: Automatic WKD hash extraction failed for $MY_EMAIL_2"
+    gpg --with-wkd-hash --list-keys "$MY_EMAIL_2"
+    read -p "Paste the SECONDARY WKD hash here (or Enter to skip): " WKD_HASH_2
+  fi
+  if [ -n "$WKD_HASH_2" ]; then
+    echo "✅ Secondary WKD Hash: $WKD_HASH_2"
+    gpg --export "$KEYID" > "$WKD_HASH_2"
+    [ -f "$WKD_HASH_2" ] && echo "✅ Secondary WKD binary file created" || echo "❌ WARNING: Failed to create WKD file '$WKD_HASH_2'"
+  else
+    echo "⚠️  Secondary WKD creation skipped (no hash provided)"
+  fi
 else
-    echo ">>> Skipping secondary email WKD (not configured)"
+  echo ">>> Skipping secondary email WKD (not configured)"
 fi
 
-# 4. Save to backup media
-echo ""
-echo ">>> Saving public key exports to backup media..."
-
-# Copy the ASCII bundle (always created)
+# Save public artifacts to backup media
 cp public_key_bundle.asc "$USB_BACKUP_PATH/$BACKUP_DIR_NAME/"
 cp public_key_bundle.asc "$SSD_BACKUP_PATH/$BACKUP_DIR_NAME/"
 
-# Copy the primary WKD Binary File (only if it exists)
 if [ -f "$WKD_HASH" ]; then
-    cp "$WKD_HASH" "$USB_BACKUP_PATH/$BACKUP_DIR_NAME/"
-    cp "$WKD_HASH" "$SSD_BACKUP_PATH/$BACKUP_DIR_NAME/"
-    
-    # Save hash string to text file for reference
-    echo "$WKD_HASH" > "$USB_BACKUP_PATH/$BACKUP_DIR_NAME/wkd_filename.txt"
-    echo "$WKD_HASH" > "$SSD_BACKUP_PATH/$BACKUP_DIR_NAME/wkd_filename.txt"
+  cp "$WKD_HASH" "$USB_BACKUP_PATH/$BACKUP_DIR_NAME/"
+  cp "$WKD_HASH" "$SSD_BACKUP_PATH/$BACKUP_DIR_NAME/"
+  echo "$WKD_HASH" > "$USB_BACKUP_PATH/$BACKUP_DIR_NAME/wkd_filename.txt"
+  echo "$WKD_HASH" > "$SSD_BACKUP_PATH/$BACKUP_DIR_NAME/wkd_filename.txt"
 fi
 
-# Copy the secondary WKD Binary File (only if it exists)
 if [ -n "$MY_EMAIL_2" ] && [ -f "$WKD_HASH_2" ]; then
-    cp "$WKD_HASH_2" "$USB_BACKUP_PATH/$BACKUP_DIR_NAME/"
-    cp "$WKD_HASH_2" "$SSD_BACKUP_PATH/$BACKUP_DIR_NAME/"
-    
-    # Save hash string to text file for reference
-    echo "$WKD_HASH_2" > "$USB_BACKUP_PATH/$BACKUP_DIR_NAME/wkd_filename_secondary.txt"
-    echo "$WKD_HASH_2" > "$SSD_BACKUP_PATH/$BACKUP_DIR_NAME/wkd_filename_secondary.txt"
+  cp "$WKD_HASH_2" "$USB_BACKUP_PATH/$BACKUP_DIR_NAME/"
+  cp "$WKD_HASH_2" "$SSD_BACKUP_PATH/$BACKUP_DIR_NAME/"
+  echo "$WKD_HASH_2" > "$USB_BACKUP_PATH/$BACKUP_DIR_NAME/wkd_filename_secondary.txt"
+  echo "$WKD_HASH_2" > "$SSD_BACKUP_PATH/$BACKUP_DIR_NAME/wkd_filename_secondary.txt"
 fi
 
-# Verify backup contents
-echo ""
-echo ">>> Verifying public key backups:"
 ls -lh "$USB_BACKUP_PATH/$BACKUP_DIR_NAME/" | grep -E "(public_key_bundle|wkd_filename|^[a-z0-9]{32}$)"
-
 sync
-
-echo ""
-echo "✅ Public keys saved:"
-echo "   📄 public_key_bundle.asc - ASCII armored public key for GitHub/Keyservers"
-if [ -f "$WKD_HASH" ]; then
-    echo "   🌐 $WKD_HASH - WKD binary for $MY_EMAIL (upload to .well-known/openpgpkey/hu/)"
-fi
-if [ -n "$MY_EMAIL_2" ] && [ -f "$WKD_HASH_2" ]; then
-    echo "   🌐 $WKD_HASH_2 - WKD binary for $MY_EMAIL_2 (upload to .well-known/openpgpkey/hu/)"
-fi
-echo ""
-echo "📝 Manual Override Commands (if needed):"
-echo "   export WKD_HASH=\"your_primary_hash_here\""
-echo "   export WKD_HASH_2=\"your_secondary_hash_here\""
-```
+~~~
 
 ## **Phase 5.5: Finalize Master Key Backup with Subkeys (CRITICAL)**
 
-**Goal:** Update the physical backups to include the newly generated S/E/A subkeys and print the complete Master Key artifacts.
+**Goal:** Refresh physical backups to include S/E/A subkeys.
 
-**Step 5.5.1: Re-Export, Print, and Verify**
+~~~bash
+cd "$GNUPGHOME"
 
-```bash
-cd $GNUPGHOME
-
-# 1. Export Secret Keys AGAIN (Now includes Master + Subkeys)
-gpg --export-secret-key $KEYID > master_secret.gpg
-
-# 2. Update Checksum (CRITICAL: Key content changed, so hash changed)
+gpg --export-secret-key "$KEYID" > master_secret.gpg
 sha256sum master_secret.gpg > master_checksum.txt
-
-# 3. Regenerate Print Artifacts (Paperkey & QRs)
 paperkey --secret-key master_secret.gpg --output master_paperkey.txt
-# Generate QR for Master Key (Using Medium error correction for better scan reliability)
 cat master_paperkey.txt | qrencode -l M -o master_qr.png
-# Generate QR for Checksum (For paper verification only)
 cat master_checksum.txt | qrencode -l M -o checksum_qr.png
 
-# 4. PRINT BACKUPS (Paperkey + QR + Checksum)
 echo ">>> Printing Master Key Artifacts..."
 lp master_qr.png
-echo ">>> Printing Master Key Paper Backup..."
 lp master_paperkey.txt
-
-echo ">>> Printing Checksum (Keep this with your paper key)..."
 lp checksum_qr.png
 lp master_checksum.txt
 
-# 5. Physical Loopback Verification
 echo ">>> VERIFICATION: Scan the printed Master QR code now."
 zbarcam --raw | tee scanned_output.txt
 
-# Verify against digital file
-diff -w master_paperkey.txt scanned_output.txt > /dev/null && echo "✅ PHYSICAL BACKUP VERIFIED: Printed QR matches digital file." || echo "❌ FAILURE: Printed QR does not match."
+diff -w master_paperkey.txt scanned_output.txt >/dev/null && echo "✅ PHYSICAL BACKUP VERIFIED: Printed QR matches digital file." || echo "❌ FAILURE: Printed QR does not match."
 
-# 6. Update Digital Backups (USB & SSD)
-# NOTE: We do NOT copy QR codes to disk. They are for paper only.
-echo ">>> Updating USB Backup..."
 cp master_secret.gpg "$USB_BACKUP_PATH/$BACKUP_DIR_NAME/"
 cp master_checksum.txt "$USB_BACKUP_PATH/$BACKUP_DIR_NAME/"
-
-echo ">>> Updating SSD Backup..."
 cp master_secret.gpg "$SSD_BACKUP_PATH/$BACKUP_DIR_NAME/"
 cp master_checksum.txt "$SSD_BACKUP_PATH/$BACKUP_DIR_NAME/"
 
-# 7. Cleanup Temporary Files
 rm scanned_output.txt master_qr.png checksum_qr.png
-echo "🧹 Cleanup complete."
-```
+~~~
 
 ## **Phase 6: YubiKey Configuration (PINs & Touch)**
 
-**Goal:** Secure the hardware keys. *Perform for BOTH YubiKeys.*
+**Goal:** Secure both YubiKeys.
 
-**Step 6.1: Set PINs (Mandatory)**
+**Step 6.1: Set PINs**
 
-* **User PIN:** 6-8 digits (Memorize). Default: 123456
-* **Admin PIN:** 8+ chars (Store in Safe). Default: 12345678
-
-```bash
-# Ensure only ONE key is plugged in
-# Verify YubiKey is detected before proceeding
+~~~bash
 gpg --card-status | grep -q "OpenPGP card" && echo "✅ YubiKey detected, proceeding with PIN setup..." || echo "❌ CRITICAL: YubiKey not detected. Insert one YubiKey and try again."
 
 gpg --change-pin
-```
+~~~
 
-1. Select (1) Change PIN
-2. Select (3) Change Admin PIN
+User PIN: 6-8 digits (memorize). Admin PIN: 8+ characters (store securely).
 
 **Step 6.2: Switch to CCID Mode (Required for Touch Policy)**
 
-**Background:** YubiKeys support multiple USB interface modes (OTP, FIDO2, CCID). OpenPGP requires CCID (Smart Card) mode. This setting is **changeable at any time** and does not affect stored cryptographic keys.
-
-**Note:** We're using CCID-only mode for maximum compatibility during this air-gapped session. You can switch to combined mode (`OTP+FIDO+CCID`) later without affecting your OpenPGP keys.
-
-```bash
+~~~bash
 echo ">>> Switching YubiKey to CCID-only mode (required for OpenPGP)..."
 ykman config mode ccid
-echo "✅ CCID mode set."
-echo "   To enable FIDO2/U2F later: ykman config mode OTP+FIDO+CCID"
-```
+echo "✅ CCID mode set. To enable FIDO2 later: ykman config mode OTP+FIDO+CCID"
+~~~
 
 **Step 6.3: Set Touch Policy**
 
-```bash
-# Kill gpg-agent to clear card cache after mode switch
+~~~bash
 echo ">>> Killing gpg-agent to clear card cache..."
 gpgconf --kill gpg-agent
 
 echo ">>> Re-plug the YubiKey and press Enter to continue..."
 read
 
-# Verify YubiKey is detected after re-insertion
-gpg --card-status | grep -q "OpenPGP card" && echo "✅ YubiKey detected after CCID mode switch" || echo "❌ CRITICAL: YubiKey not detected. Check connection and try again."
+gpg --card-status | grep -q "OpenPGP card" && echo "✅ YubiKey detected after CCID mode switch" || echo "❌ CRITICAL: YubiKey not detected."
 
-# Require touch for operations
 ykman openpgp keys set-touch sig ON
 ykman openpgp keys set-touch aut ON
 ykman openpgp keys set-touch enc ON
-```
+~~~
 
 ## **Phase 7: Loading Keys to Hardware**
 
-**Goal:** Move subkeys to YubiKeys. **WARNING:** Removes them from disk.
+**Goal:** Move subkeys to both YubiKeys (removes them from disk). The backup snapshot remains the recovery point.
 
 **Step 7.1: Snapshot Keyring**
 
-Before making any irreversible changes, create a backup snapshot of the current GPG home directory.
-
-```bash
+~~~bash
 echo ">>> Creating backup snapshot of keyring before hardware transfer..."
-cp -r $GNUPGHOME $GNUPGHOME.bak
-
-# Verify snapshot was created
-ls -ld $GNUPGHOME.bak && echo "✅ Snapshot created: $GNUPGHOME.bak" || echo "❌ CRITICAL: Snapshot creation failed"
-```
-
----
+cp -r "$GNUPGHOME" "$GNUPGHOME.bak"
+ls -ld "$GNUPGHOME.bak" && echo "✅ Snapshot created: $GNUPGHOME.bak" || echo "❌ CRITICAL: Snapshot creation failed"
+~~~
 
 **Step 7.2: Load YubiKey #1 (Primary)**
 
-**Pre-Flight Checks:**
-
-```bash
+~~~bash
 echo ">>> Pre-flight checks for YubiKey #1..."
-
-# 1. Verify YubiKey is detected
 if ! gpg --card-status | grep -q "OpenPGP card"; then
-    echo "❌ CRITICAL: YubiKey not detected. Insert YubiKey #1 and try again."
-    echo "    Debug: Run 'gpg --card-status' manually to see card state"
+  echo "❌ CRITICAL: YubiKey not detected. Insert YubiKey #1 and try again."
 else
-    echo "✅ YubiKey #1 detected"
+  echo "✅ YubiKey #1 detected"
 fi
-
-# 2. Verify all three subkeys exist (should be key 1, 2, 3)
 SUBKEY_COUNT=$(gpg --list-secret-keys "$KEYID" | grep -c "^ssb")
-if [ "$SUBKEY_COUNT" -ne 3 ]; then
-    echo "❌ CRITICAL: Expected 3 subkeys, found $SUBKEY_COUNT"
-    echo "    Run 'gpg --list-secret-keys $KEYID' to verify"
-else
-    echo "✅ All 3 subkeys present (Sign, Encrypt, Auth)"
-fi
+[ "$SUBKEY_COUNT" -ne 3 ] && echo "❌ CRITICAL: Expected 3 subkeys, found $SUBKEY_COUNT" || echo "✅ All 3 subkeys present (Sign, Encrypt, Auth)"
 
-# 3. Display current key structure with capabilities for reference
-echo ""
-echo ">>> Current key structure (VERIFY ORDERING BEFORE TRANSFER):"
-echo "    The list below shows which key index maps to which capability."
-echo "    During transfer, you'll select keys by NUMBER (key 1, key 2, key 3)."
-echo ""
 gpg --list-secret-keys --with-keygrip --with-subkey-fingerprint "$KEYID"
-echo ""
-echo "Expected ordering (verify above matches this):"
-echo "  ssb   [S]  = Signing (key 1)"
-echo "  ssb   [E]  = Encryption (key 2)"
-echo "  ssb   [A]  = Authentication (key 3)"
-echo ""
-read -p "Confirm ordering matches expected? Press Enter to continue or Ctrl+C to abort..."
-```
+read -p "Confirm ordering matches expected (S,E,A). Press Enter to continue or Ctrl+C to abort..." _
 
----
+cat << 'EOF'
+⚠️  CRITICAL CHECKPOINT: POINT OF NO RETURN (YubiKey #1)
+- Keys will move to YubiKey #1 and be recoverable only from the snapshot.
+- Both YubiKeys will hold identical keys.
+- Confirm snapshot and backups exist.
+EOF
+-read -p "Type 'YES' to proceed with keytocard on YubiKey #1: " CONFIRM
+-[ "$CONFIRM" != "YES" ] && { echo "❌ Operation cancelled."; exit 1; } || echo "✅ Proceeding with keytocard for YubiKey #1..."
++read -p "Type 'YES' to proceed with keytocard on YubiKey #1: " CONFIRM
++if [ "$CONFIRM" != "YES" ]; then
++  echo "❌ Operation cancelled."
++  return 1 2>/dev/null || true
++else
++  echo "✅ Proceeding with keytocard for YubiKey #1..."
++fi
 
-**CRITICAL CHECKPOINT: Point of No Return**
-
-```bash
-echo ""
-echo "═══════════════════════════════════════════════════════════════"
-echo "⚠️  CRITICAL CHECKPOINT: POINT OF NO RETURN (YubiKey #1)"
-echo "═══════════════════════════════════════════════════════════════"
-echo "The next operation will PERMANENTLY move subkeys to YubiKey #1."
-echo "After this, they can ONLY be recovered from the backup snapshot."
-echo ""
-echo "IMPORTANT: Both YubiKey #1 and YubiKey #2 will receive IDENTICAL keys."
-echo "This creates redundancy - if one YubiKey fails, the other is a backup."
-echo ""
-echo "Before proceeding, verify:"
-echo "  1. YubiKey #1 is inserted and detected (check above)"
-echo "  2. Backup snapshot exists at: $GNUPGHOME.bak"
-echo "  3. Digital backups are confirmed at:"
-echo "     - USB: $USB_BACKUP_PATH/$BACKUP_DIR_NAME"
-echo "     - SSD: $SSD_BACKUP_PATH/$BACKUP_DIR_NAME"
-echo "  4. You have the Admin PIN for this YubiKey ready"
-echo ""
-read -p "Type 'YES' to proceed with YubiKey #1 keytocard operation: " CONFIRM
-
-if [ "$CONFIRM" != "YES" ]; then
-    echo "❌ Operation cancelled by user."
-    echo "   You may re-run this phase when ready."
-    echo "   To restart: gpg --edit-key $KEYID"
-else
-    echo "✅ Proceeding with keytocard for YubiKey #1..."
-fi
-```
-
----
-
-**Interactive Key Transfer:**
-
-```bash
-echo ""
 echo ">>> Starting GPG interactive session for YubiKey #1..."
-echo ""
-echo "═══════════════════════════════════════════════════════════════"
-echo "INSTRUCTIONS FOR GPG INTERACTIVE SESSION (YubiKey #1)"
-echo "═══════════════════════════════════════════════════════════════"
-echo ""
-echo "You will see a 'gpg>' prompt. Follow these steps EXACTLY:"
-echo ""
-echo "--- STEP 1: Transfer Signing Subkey (S) ---"
-echo "  1. Type: key 1"
-echo "     (You should see 'ssb*' next to the signing key - asterisk means selected)"
-echo "  2. Type: keytocard"
-echo "  3. Select: 1 (Signature key)"
-echo "  4. Enter Admin PIN when prompted"
-echo "  5. Type: key 1"
-echo "     (This DESELECTS the key - asterisk should disappear)"
-echo ""
-echo "--- STEP 2: Transfer Encryption Subkey (E) ---"
-echo "  1. Type: key 2"
-echo "     (You should see 'ssb*' next to the encryption key)"
-echo "  2. Type: keytocard"
-echo "  3. Select: 2 (Encryption key)"
-echo "  4. Enter Admin PIN when prompted"
-echo "  5. Type: key 2"
-echo "     (This DESELECTS the key)"
-echo ""
-echo "--- STEP 3: Transfer Authentication Subkey (A) ---"
-echo "  1. Type: key 3"
-echo "     (You should see 'ssb*' next to the authentication key)"
-echo "  2. Type: keytocard"
-echo "  3. Select: 3 (Authentication key)"
-echo "  4. Enter Admin PIN when prompted"
-echo "  5. NO NEED to deselect (we're done)"
-echo ""
-echo "--- STEP 4: Save and Exit ---"
-echo "  1. Type: save"
-echo "     (This commits the changes and exits)"
-echo ""
-echo "═══════════════════════════════════════════════════════════════"
-echo ""
-echo "Press Enter to start the interactive session..."
-read
+cat << 'EOF'
+At the gpg> prompt:
+- key 1 → keytocard → 1 (Signature) → Admin PIN → key 1 (deselect)
+- key 2 → keytocard → 2 (Encryption) → Admin PIN → key 2 (deselect)
+- key 3 → keytocard → 3 (Authentication) → Admin PIN
+- save
+EOF
+read -p "Press Enter to start the interactive session..." _
 
-gpg --edit-key $KEYID
-```
+gpg --edit-key "$KEYID"
 
----
-
-**Post-Transfer Verification (YubiKey #1):**
-
-```bash
-echo ""
 echo ">>> Verifying YubiKey #1 key transfer..."
+gpgconf --kill gpg-agent; sleep 2
 
-# Kill and restart agent to refresh card state
-gpgconf --kill gpg-agent
-sleep 2
+gpg --card-status | grep -q "Signature key" && echo "✅ Signature key detected on YubiKey #1" || echo "⚠️  Signature key not detected"
+gpg --card-status | grep -q "Encryption key" && echo "✅ Encryption key detected on YubiKey #1" || echo "⚠️  Encryption key not detected"
+gpg --card-status | grep -q "Authentication key" && echo "✅ Authentication key detected on YubiKey #1" || echo "⚠️  Authentication key not detected"
 
-# Check if keys are now on the card
-if ! gpg --card-status | grep -q "Signature key"; then
-    echo "⚠️  WARNING: Signature key not detected on YubiKey #1"
-    echo "    Run 'gpg --card-status' manually to inspect"
-else
-    echo "✅ Signature key detected on YubiKey #1"
-fi
-
-if ! gpg --card-status | grep -q "Encryption key"; then
-    echo "⚠️  WARNING: Encryption key not detected on YubiKey #1"
-else
-    echo "✅ Encryption key detected on YubiKey #1"
-fi
-
-if ! gpg --card-status | grep -q "Authentication key"; then
-    echo "⚠️  WARNING: Authentication key not detected on YubiKey #1"
-else
-    echo "✅ Authentication key detected on YubiKey #1"
-fi
-
-# Verify local subkeys are now stubs (indicated by '>' in gpg --list-secret-keys)
-echo ""
-echo ">>> Local keyring status (subkeys should now show as stubs):"
 gpg --list-secret-keys "$KEYID"
-echo ""
-echo "✅ YubiKey #1 loading complete"
-echo "   Remove YubiKey #1 before proceeding to YubiKey #2"
-echo ""
-read -p "Press Enter after removing YubiKey #1..."
-```
-
----
+-read -p "Remove YubiKey #1, then press Enter..." _
+read -p "Remove YubiKey #1, then press Enter..." _
+~~~
 
 **Step 7.3: Load YubiKey #2 (Backup)**
 
-**Pre-Flight Checks:**
-
-```bash
-echo ""
+~~~bash
 echo ">>> Pre-flight checks for YubiKey #2..."
-
-# 1. Verify YubiKey #2 is detected and is a DIFFERENT card
 if ! gpg --card-status | grep -q "OpenPGP card"; then
-    echo "❌ CRITICAL: YubiKey not detected. Insert YubiKey #2 and try again."
-    echo "    Debug: Run 'gpg --card-status' manually to see card state"
+  echo "❌ CRITICAL: YubiKey not detected. Insert YubiKey #2 and try again."
 else
-    echo "✅ YubiKey #2 detected"
+  echo "✅ YubiKey #2 detected"
 fi
-
-# 2. Warn if YubiKey #2 appears to be the same card (has keys already)
 if gpg --card-status | grep -q "Signature key.*\[key1\]"; then
-    echo "⚠️  WARNING: This YubiKey appears to already have keys loaded."
-    echo "    Ensure you removed YubiKey #1 and inserted YubiKey #2."
-    echo "    Press Ctrl+C to abort if this is YubiKey #1."
-    read -p "Press Enter to continue if you are certain this is YubiKey #2..."
+  echo "⚠️  WARNING: This YubiKey appears to already have keys. Ensure YubiKey #1 is removed."; read -p "Press Enter to continue if certain..." _
 fi
-```
 
----
-
-**Restore Keys to Disk:**
-
-Before loading YubiKey #2, we must restore the subkeys to disk from the backup snapshot (since YubiKey #1 already removed them).
-
-```bash
 echo ">>> Restoring keys to disk from backup snapshot..."
-
-# Kill agent to ensure clean state
 gpgconf --kill gpg-agent
+rm -rf "$GNUPGHOME"
+cp -r "$GNUPGHOME.bak" "$GNUPGHOME"
 
-# Remove current GPG home (which has stubs pointing to YubiKey #1)
-rm -rf $GNUPGHOME
-
-# Restore from snapshot
-cp -r $GNUPGHOME.bak $GNUPGHOME
-
-# Verify restoration worked
-if ! gpg --list-secret-keys "$KEYID" &>/dev/null; then
-    echo "❌ CRITICAL: Key restoration from snapshot failed"
-    echo "    Snapshot path: $GNUPGHOME.bak"
-    echo "    Run 'gpg --list-secret-keys' to debug"
-else
-    echo "✅ Keys restored from snapshot"
-fi
-
-# Verify all three subkeys exist again (should NOT be stubs)
+gpg --list-secret-keys "$KEYID" >/dev/null 2>&1 && echo "✅ Keys restored from snapshot" || echo "❌ CRITICAL: Key restoration from snapshot failed"
 SUBKEY_COUNT=$(gpg --list-secret-keys "$KEYID" | grep -c "^ssb")
-if [ "$SUBKEY_COUNT" -ne 3 ]; then
-    echo "❌ CRITICAL: Expected 3 subkeys after restoration, found $SUBKEY_COUNT"
-    echo "    Run 'gpg --list-secret-keys $KEYID' to verify"
-else
-    echo "✅ All 3 subkeys restored (ready for YubiKey #2)"
-fi
+[ "$SUBKEY_COUNT" -ne 3 ] && echo "❌ CRITICAL: Expected 3 subkeys after restoration, found $SUBKEY_COUNT" || echo "✅ All 3 subkeys restored"
 
-# Display current key structure for reference
-echo ""
-echo ">>> Current key structure (for reference during keytocard):"
 gpg --list-secret-keys --with-keygrip "$KEYID"
-echo ""
-```
 
----
+cat << 'EOF'
+⚠️  CRITICAL CHECKPOINT: POINT OF NO RETURN (YubiKey #2)
+- Subkeys will move to YubiKey #2.
+- Recovery point is the snapshot at $GNUPGHOME.bak.
+EOF
+-read -p "Type 'YES' to proceed with keytocard on YubiKey #2: " CONFIRM
+-[ "$CONFIRM" != "YES" ] && { echo "❌ Operation cancelled."; exit 1; } || echo "✅ Proceeding with keytocard for YubiKey #2..."
++read -p "Type 'YES' to proceed with keytocard on YubiKey #2: " CONFIRM
++if [ "$CONFIRM" != "YES" ]; then
++  echo "❌ Operation cancelled."
++  return 1 2>/dev/null || true
++else
++  echo "✅ Proceeding with keytocard for YubiKey #2..."
++fi
 
-**CRITICAL CHECKPOINT: Point of No Return (YubiKey #2)**
-
-```bash
-echo ""
-echo "═══════════════════════════════════════════════════════════════"
-echo "⚠️  CRITICAL CHECKPOINT: POINT OF NO RETURN (YubiKey #2)"
-echo "═══════════════════════════════════════════════════════════════"
-echo "The next operation will PERMANENTLY move subkeys to YubiKey #2."
-echo "This is the FINAL hardware transfer. After this:"
-echo "  - Subkeys will exist ONLY on YubiKey #1 and YubiKey #2"
-echo "  - The backup snapshot ($GNUPGHOME.bak) is your last recovery point"
-echo ""
-echo "Before proceeding, verify:"
-echo "  1. YubiKey #2 is inserted and detected (check above)"
-echo "  2. YubiKey #1 has been removed"
-echo "  3. Keys were successfully restored from snapshot (check above)"
-echo "  4. You have the Admin PIN for YubiKey #2 ready"
-echo ""
-read -p "Type 'YES' to proceed with YubiKey #2 keytocard operation: " CONFIRM
-
-if [ "$CONFIRM" != "YES" ]; then
-    echo "❌ Operation cancelled by user."
-    echo "   You may re-run this phase when ready."
-    echo "   To restart: gpg --edit-key $KEYID"
-else
-    echo "✅ Proceeding with keytocard for YubiKey #2..."
-fi
-```
-
----
-
-**Interactive Key Transfer (YubiKey #2):**
-
-```bash
-echo ""
 echo ">>> Starting GPG interactive session for YubiKey #2..."
-echo ""
-echo "═══════════════════════════════════════════════════════════════"
-echo "INSTRUCTIONS FOR GPG INTERACTIVE SESSION (YubiKey #2)"
-echo "═══════════════════════════════════════════════════════════════"
-echo ""
-echo "You will see a 'gpg>' prompt. Follow these steps EXACTLY:"
-echo ""
-echo "--- STEP 1: Transfer Signing Subkey (S) ---"
-echo "  1. Type: key 1"
-echo "  2. Type: keytocard"
-echo "  3. Select: 1 (Signature key)"
-echo "  4. Enter Admin PIN when prompted"
-echo "  5. Type: key 1 (deselect)"
-echo ""
-echo "--- STEP 2: Transfer Encryption Subkey (E) ---"
-echo "  1. Type: key 2"
-echo "  2. Type: keytocard"
-echo "  3. Select: 2 (Encryption key)"
-echo "  4. Enter Admin PIN when prompted"
-echo "  5. Type: key 2 (deselect)"
-echo ""
-echo "--- STEP 3: Transfer Authentication Subkey (A) ---"
-echo "  1. Type: key 3"
-echo "  2. Type: keytocard"
-echo "  3. Select: 3 (Authentication key)"
-echo "  4. Enter Admin PIN when prompted"
-echo ""
-echo "--- STEP 4: Save and Exit ---"
-echo "  1. Type: save"
-echo ""
-echo "═══════════════════════════════════════════════════════════════"
-echo ""
-echo "Press Enter to start the interactive session..."
-read
+cat << 'EOF'
+At the gpg> prompt:
+- key 1 → keytocard → 1 (Signature) → Admin PIN → key 1 (deselect)
+- key 2 → keytocard → 2 (Encryption) → Admin PIN → key 2 (deselect)
+- key 3 → keytocard → 3 (Authentication) → Admin PIN
+- save
+EOF
+read -p "Press Enter to start the interactive session..." _
 
-gpg --edit-key $KEYID
-```
+gpg --edit-key "$KEYID"
 
----
-
-**Post-Transfer Verification (YubiKey #2):**
-
-```bash
-echo ""
 echo ">>> Verifying YubiKey #2 key transfer..."
+gpgconf --kill gpg-agent; sleep 2
 
-# Kill and restart agent to refresh card state
-gpgconf --kill gpg-agent
-sleep 2
+gpg --card-status | grep -q "Signature key" && echo "✅ Signature key detected on YubiKey #2" || echo "⚠️  Signature key not detected"
+gpg --card-status | grep -q "Encryption key" && echo "✅ Encryption key detected on YubiKey #2" || echo "⚠️  Encryption key not detected"
+gpg --card-status | grep -q "Authentication key" && echo "✅ Authentication key detected on YubiKey #2" || echo "⚠️  Authentication key not detected"
 
-# Check if keys are now on the card
-if ! gpg --card-status | grep -q "Signature key"; then
-    echo "⚠️  WARNING: Signature key not detected on YubiKey #2"
-    echo "    Run 'gpg --card-status' manually to inspect"
-else
-    echo "✅ Signature key detected on YubiKey #2"
-fi
-
-if ! gpg --card-status | grep -q "Encryption key"; then
-    echo "⚠️  WARNING: Encryption key not detected on YubiKey #2"
-else
-    echo "✅ Encryption key detected on YubiKey #2"
-fi
-
-if ! gpg --card-status | grep -q "Authentication key"; then
-    echo "⚠️  WARNING: Authentication key not detected on YubiKey #2"
-else
-    echo "✅ Authentication key detected on YubiKey #2"
-fi
-
-# Verify local subkeys are now stubs
-echo ""
-echo ">>> Local keyring status (subkeys should now show as stubs):"
 gpg --list-secret-keys "$KEYID"
-echo ""
-echo "✅ YubiKey #2 loading complete"
-echo "   Both YubiKeys now contain identical subkeys"
-echo ""
-```
+~~~
 
 ## **Phase 8: Final Verification & Cleanup**
 
-**Goal:** Ensure keys work and wipe RAM.
+**Goal:** Verify hardware operation and wipe RAM.
 
 **Step 8.1: Test YubiKey**
 
-```bash
-# Verify YubiKey is still detected and operational
+~~~bash
 if ! gpg --card-status | grep -q "OpenPGP card"; then
-    echo "❌ CRITICAL: YubiKey not detected for final testing"
+  echo "❌ CRITICAL: YubiKey not detected for final testing"
 else
-    echo "✅ YubiKey detected for final testing"
+  echo "✅ YubiKey detected for final testing"
 fi
 
-# Test signature creation
 echo "Testing Signature..." | gpg --sign --armor > test_signature.asc
-# Should ask for User PIN and Touch
-
-# Verify the signature
 if gpg --verify test_signature.asc 2>&1 | grep -q "Good signature"; then
-    echo "✅ Signature verification passed"
+  echo "✅ Signature verification passed"
 else
-    echo "⚠️  Signature verification check: Review output above"
+  echo "⚠️  Signature verification check: Review output above"
 fi
-
 rm test_signature.asc
-
-echo "✅ YubiKey signature test completed successfully"
-```
+~~~
 
 **Step 8.2: Secure Wipe**
 
-```bash
-# Kill gpg-agent first to ensure clean shutdown
+~~~bash
 gpgconf --kill gpg-agent
 
-# Unmount backups with error handling
 echo ">>> Unmounting USB Backup..."
 umount "$USB_BACKUP_PATH" 2>&1 || echo "⚠️  USB unmount failed (may already be unmounted)"
 
 echo ">>> Unmounting SSD Backup..."
 umount "$SSD_BACKUP_PATH" 2>&1 || echo "⚠️  SSD unmount failed (may already be unmounted)"
 
-# Securely wipe and remove local temporary files
-find $GNUPGHOME -type f -exec shred -u {} \;
-find $GNUPGHOME.bak -type f -exec shred -u {} \;
-
-# Remove the temporary directories to ensure /tmp is clean
-rm -rf $GNUPGHOME $GNUPGHOME.bak
+find "$GNUPGHOME" -type f -exec shred -u {} \;
+find "$GNUPGHOME.bak" -type f -exec shred -u {} \;
+rm -rf "$GNUPGHOME" "$GNUPGHOME.bak"
 echo ">>> SETUP COMPLETE. POWER OFF."
-```
+~~~
 
 ## **Appendix A: Emergency Operations**
 
-Use this section if you are recovering from disaster (Total Loss of Keys) or Compromise (Lost YubiKey).
-
 ### **A.1: Restore from Digital Backup (USB/SSD)**
-*Use this if your YubiKeys are lost but you have your USB/SSD backup.*
 
 1. Boot into the clean environment (Phase 0).
-2. Mount your USB/SSD backup.
-3. **Import the Master Key:**
-   ```bash
-   gpg --import "$USB_BACKUP_PATH/$BACKUP_DIR_NAME/master_secret.gpg"
-   ```
-4. **Set Trust Level:** Like Phase 4, set the key trust level to Ultimate.
-   ```bash
-   gpg --edit-key $KEYID
-   # Type 'trust' -> Select '5' (Ultimate) -> Confirm 'y' -> Type 'quit'
-   ```
-6. **Verify Import:** `gpg --list-secret-keys`
-7. **Next Steps:**
-   - If replacing YubiKeys: Go to **Phase 5** (Generate Subkeys) or **Phase 7** (Load to Hardware).
+2. Mount USB/SSD backup.
+3. Import the master key:
+
+~~~bash
+gpg --import "$USB_BACKUP_PATH/$BACKUP_DIR_NAME/master_secret.gpg"
+~~~
+
+4. Set trust to Ultimate:
+
+~~~bash
+gpg --edit-key "$KEYID"
+# trust → 5 → y → quit
+~~~
+
+5. Verify: `gpg --list-secret-keys`
+6. If replacing YubiKeys: go to Phase 5 (generate subkeys) or Phase 7 (load to hardware).
 
 ### **A.2: Restore from Paper Backup**
-*Use this ONLY if digital backups (USB/SSD) are destroyed or corrupted.*
 
-**Step 1: Online Preparation (Tools & Public Key)**
+**Online prep:** Ensure **paperkey** and **zbar-tools** are installed. Download your public key (**public_key_bundle.asc**) from WKD/website/keyserver while online.
 
-* **Action:** Ensure you are still connected to the internet.
-* **Install Tools:** Ensure `paperkey` and `zbar-tools` are installed (see Phase 0.2).
-* **CRITICAL: Download Public Key:** While connected to the internet, download your current public key (`public_key_bundle.asc`) from your WKD, website, or keyserver. Without digital backups, this online source is likely your only copy of the public data.
-* **Note:** You CANNOT restore from paper without the public key.
+**Air-gap:** Disconnect network and verify isolation (same check as Phase 0.4).
 
-**Step 2: Establish Air-Gap**
+**Reconstruction:**
 
-* **Action:** Physically disconnect the Ethernet cable or disable the Wi-Fi adapter.
-* **Verify:** Run the following command to ensure isolation:
-
-```bash
-ping -c 2 8.8.8.8
-# Output must be "Network is unreachable" or 100% packet loss.
-```
-
-* **Warning:** Do not reconnect to the internet for the remainder of this restoration session.
-
-**Step 3: Secret Reconstruction**
-
-* **Scan Paper Key:**
-   ```bash
-   zbarcam --raw > scanned_paperkey.txt
-   # (Or type the text manually if camera fails)
-   ```
-* **Reconstruct Secret Key:**
-   ```bash
-   paperkey --pubring public_key_bundle.asc --secrets scanned_paperkey.txt --output restored_master.gpg
-   ```
-* **Import:** `gpg --import restored_master.gpg`
+~~~bash
+zbarcam --raw > scanned_paperkey.txt   # or type manually
+paperkey --pubring public_key_bundle.asc --secrets scanned_paperkey.txt --output restored_master.gpg
+gpg --import restored_master.gpg
+~~~
 
 ### **A.3: Revoking a Compromised Subkey**
-*Use this if a YubiKey is lost/stolen. This invalidates the old specific key while keeping your Master Identity safe.*
 
-1. **Import Master Key:** (See A.1 or A.2).
-2. **Edit Keyring:**
-   ```bash
-   gpg --edit-key $KEYID
-   ```
-3. **Select Subkey:**
-   - Type `key 1` (or 2, 3) to select the compromised subkey.
-   - Look for the `*` marker next to the selected key (e.g., `ssb*`).
-4. **Revoke:**
-   - Type `revkey`.
-   - **Reason:** Select "Key has been compromised".
-   - **Description:** e.g., "YubiKey #1 Lost".
-   - Confirm with `y`.
-5. **Save:** Type `save`.
-6. **Publish Revocation (CRITICAL):**
-   - You must update your public key online so others know to stop using that subkey.
-   ```bash
-   gpg --export $KEYID --armor > new_public_bundle.asc
-   ```
-   - **Upload:** Overwrite the existing file on your WKD/GCS.
-   - *Note: Your WKD Filename (Hash) DOES NOT CHANGE. It is based on your email, not the key content.*
-7. **Next:** Go to **Phase 5** to generate a fresh subkey to replace the one you just revoked.
+1. Import master key (A.1 or A.2).
+2. Edit keyring:
+
+~~~bash
+gpg --edit-key "$KEYID"
+~~~
+
+3. Select subkey (`key 1` or `key 2` or `key 3`), confirm `*` shows.
+4. `revkey` → Reason: compromised → Description (e.g., "YubiKey #1 Lost") → confirm `y` → `save`.
+5. Publish updated public key:
+
+~~~bash
+gpg --export "$KEYID" --armor > new_public_bundle.asc
+~~~
+
+Upload to WKD/website/keyserver (WKD filename hash is unchanged).
 
 ### **A.4: Recovering from Session Interruption**
-*Use this if your terminal session crashes or is accidentally closed before completing the protocol.*
 
-If your terminal session crashes or is accidentally closed before completing the protocol, you can recover your environment variables:
+1. Reopen a terminal.
+2. Restore session vars:
 
-1. Reopen a terminal
-2. Run:
-   ```bash
-   source /tmp/tmp.gnupg_dpa_tmp/session_vars.sh
-   ```
-3. Verify variables are restored:
-   ```bash
-   echo "GNUPGHOME: $GNUPGHOME"
-   echo "Email: $MY_EMAIL"
-   echo "USB Path: $USB_BACKUP_PATH"
-   echo "SSD Path: $SSD_BACKUP_PATH"
-   ```
-4. If `KEYID` is empty but you already created the master key, recapture it:
-   ```bash
-   export KEYID=$(gpg --list-keys --with-colons "$MY_EMAIL" | awk -F: '/^fpr:/ { print $10; exit }')
-   echo "Key ID: $KEYID"
-   ```
-5. Resume the protocol from where you left off.
+~~~bash
+source "$GNUPGHOME/session_vars.sh"
+~~~
 
-**Note:** The session recovery file is created automatically in Phase 0.1 and contains all your environment variables except `KEYID` (which is captured later in Phase 2.2).
+3. Verify variables:
 
+~~~bash
+echo "GNUPGHOME: $GNUPGHOME"
+echo "Email: $MY_EMAIL"
+echo "USB Path: $USB_BACKUP_PATH"
+echo "SSD Path: $SSD_BACKUP_PATH"
+~~~
+
+4. If **$KEYID** is empty but the master key exists:
+
+~~~bash
+export KEYID=$(gpg --list-keys --with-colons "$MY_EMAIL" | awk -F: '/^fpr:/ { print $10; exit }')
+echo "Key ID: $KEYID"
+~~~
+
+5. Resume the protocol at the appropriate phase.
