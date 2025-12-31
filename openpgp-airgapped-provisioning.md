@@ -69,6 +69,7 @@ export SSD_BACKUP_PATH="/media/user/ssd_backup"
 export GNUPGHOME=/tmp/tmp.gnupg_dpa_tmp
 export BACKUP_DIR_NAME="PGP_Master_Backup"
 mkdir -p "$GNUPGHOME"
+chmod 700 "$GNUPGHOME"
 
 # Save variables for session recovery
 cat << EOF > "$GNUPGHOME/session_vars.sh"
@@ -103,26 +104,9 @@ sudo apt-get install -y $PACKAGES
 
 4. **Install Printer Drivers (Optional)**:
 
-   **A) Driverless (Recommended for Modern Printers):**
-   IPP-USB is installed above. Try adding your printer in Settings → Printers first.
-
-   **B) Legacy Brother DCP-J725DW (Fallback):**
-   Requires enabling 32-bit architecture.
-~~~bash
-# Enable 32-bit architecture
-sudo dpkg --add-architecture i386
-sudo apt-get update
-
-# Install 32-bit dependencies
-sudo apt-get install -y lib32stdc++6 printer-driver-brlaser
-
-# Download & Install Legacy Drivers (Direct from Brother)
-mkdir -p /tmp/brother_drivers && cd /tmp/brother_drivers
-wget "https://download.brother.com/pub/com/linux/linux/dlf/dcpj725dwlpr-3.0.1-1.i386.deb"
-wget "https://download.brother.com/pub/com/linux/linux/dlf/dcpj725dwcupswrapper-3.0.0-1.i386.deb"
-sudo dpkg -i *.deb
-sudo apt-get install -f -y  # Fix any missing dependencies
-~~~
+   Modern printers with IPP-USB support (installed above) typically work driverless. Try adding your printer in Settings → Printers first.
+   
+   If your printer requires vendor-specific drivers, consult the manufacturer's documentation for Debian/Linux driver installation.
 
 5. **Verify Tools**:
 ~~~bash
@@ -152,24 +136,8 @@ fi
 [ $MISSING_COUNT -gt 0 ] && echo "⚠️  $MISSING_COUNT tool(s) missing. Install manually: sudo apt-get install -y <package>" || echo "✅ All tools available."
 ~~~
 
-**Step 0.2 (Optional): Offline Bundle for Air-Gap Injection**
-
-On a separate online Debian Stable machine:
-
-~~~bash
-# Create a local pool of .deb files for required packages
-mkdir -p /tmp/pgp_bundle && cd /tmp/pgp_bundle
-apt-get update
-apt-get download gnupg paperkey qrencode zbar-tools coreutils yubikey-manager wamerican scdaemon pcscd cups-client rng-tools
-ls -lh
-~~~
-
-Copy the directory to your air-gapped media. On the air-gapped Debian Live system, install with:
-
-~~~bash
-cd /path/to/pgp_bundle
-sudo dpkg -i *.deb || { echo "⚠️ dpkg reported errors; attempting apt-get -f install..."; sudo apt-get -f install -y || echo "❌ Offline bundle install failed; review errors above."; }
-~~~
+> [!NOTE]
+> **For offline/air-gapped environments:** If you cannot temporarily connect to the internet during Phase 0, see [appendix-offline-bundle.md](appendix-offline-bundle.md) for instructions on preparing an offline package bundle.
 
 **Step 0.3: Printer Setup (Network Required)**
 
@@ -223,6 +191,7 @@ Goal: Prove **zbarcam** and **paperkey** work with your camera/printer before an
 # Use an isolated temp GNUPGHOME for the dummy key
 export GNUPGHOME_DIAG=/tmp/tmp.gnupg_diag
 mkdir -p "$GNUPGHOME_DIAG"
+chmod 700 "$GNUPGHOME_DIAG"
 
 gpg --homedir "$GNUPGHOME_DIAG" --quick-generate-key "QR Test <qr-test@example.com>" ed25519 default 1d
 DUMMY_KEYID=$(gpg --homedir "$GNUPGHOME_DIAG" --list-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')
@@ -261,6 +230,7 @@ read
 # Create separate temp directory for rebuild verification
 export GNUPGHOME_REBUILD=/tmp/tmp.gnupg_rebuild
 mkdir -p "$GNUPGHOME_REBUILD"
+chmod 700 "$GNUPGHOME_REBUILD"
 
 # Scan the printed QR code
 zbarcam --raw > "$GNUPGHOME_REBUILD/scanned_paperkey.txt"
@@ -302,6 +272,7 @@ Goal: Validate YubiKey detection, CCID mode, touch policy, and keytocard workflo
 ~~~bash
 export GNUPGHOME_YK_DIAG=/tmp/tmp.gnupg_yk_diag
 mkdir -p "$GNUPGHOME_YK_DIAG"
+chmod 700 "$GNUPGHOME_YK_DIAG"
 
 gpg --homedir "$GNUPGHOME_YK_DIAG" --quick-generate-key "YubiKey Test <yk-test@example.com>" ed25519 default 1d
 YK_TEST_KEYID=$(gpg --homedir "$GNUPGHOME_YK_DIAG" --list-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')
@@ -360,6 +331,9 @@ fi
 Ensure **rng-tools** is running and feed manual salt into the kernel pool.
 
 ~~~bash
+# Set restrictive umask for all GPG operations (ensures files get 600 permissions)
+umask 077
+
 # Start rngd if not already active
 sudo systemctl enable --now rng-tools || sudo rngd -r /dev/urandom -o /dev/random -b
 
