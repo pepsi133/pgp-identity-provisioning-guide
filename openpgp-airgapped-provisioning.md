@@ -177,6 +177,44 @@ sudo dpkg -i *.deb || { echo "⚠️ dpkg reported errors; attempting apt-get -f
 * Set the printer as default (right-click in the GUI or use the dropdown menu).
 * Print a test page before disconnecting.
 
+**Step 0.3.1: Define Print Helper Function**
+
+This function verifies printer availability and confirms successful printing before proceeding.
+
+~~~bash
+# Helper function for safe printing with verification
+print_file() {
+  local FILE="$1"
+  local DESCRIPTION="${2:-file}"
+  
+  if [ ! -f "$FILE" ]; then
+    echo "❌ ERROR: File not found: $FILE"
+    return 1
+  fi
+  
+  # Check if default printer is set
+  if ! lpstat -d >/dev/null 2>&1; then
+    echo "❌ ERROR: No default printer set. Run: lpstat -p -d"
+    echo "   Then set default with: sudo lpoptions -d PRINTER_NAME"
+    return 1
+  fi
+  
+  local DEFAULT_PRINTER=$(lpstat -d | awk '{print $NF}')
+  echo ">>> Printing $DESCRIPTION to $DEFAULT_PRINTER..."
+  
+  if lp "$FILE" 2>&1; then
+    echo "✅ Print job submitted for $DESCRIPTION"
+    read -p "Press Enter after confirming the $DESCRIPTION printed successfully, or Ctrl+C to abort..." _
+    return 0
+  else
+    echo "❌ ERROR: Print failed for $DESCRIPTION"
+    echo "   Check printer status with: lpstat -p -d"
+    read -p "Press Enter to retry, or Ctrl+C to abort..." _
+    print_file "$FILE" "$DESCRIPTION"
+  fi
+}
+~~~
+
 **Step 0.4 (Optional but Recommended, Network OK): Diagnostic QR Test (Dummy Loopback)**
 
 Goal: Prove **zbarcam** and **paperkey** work with your camera/printer before any secrets or passphrases are generated. Do this while network is available so you can troubleshoot drivers if needed.
@@ -194,7 +232,12 @@ paperkey --secret-key "$GNUPGHOME_DIAG/dummy_secret.gpg" --output "$GNUPGHOME_DI
 cat "$GNUPGHOME_DIAG/dummy_paperkey.txt" | qrencode -l M -o "$GNUPGHOME_DIAG/dummy_qr.png"
 
 # Print and scan to mobile (OpenKeychain or similar) to confirm end-to-end
-lp "$GNUPGHOME_DIAG/dummy_qr.png"
+print_file "$GNUPGHOME_DIAG/dummy_qr.png" "dummy QR code" || {
+  echo "⚠️  Skipping scan test due to print failure"
+  rm -rf "$GNUPGHOME_DIAG"
+  unset GNUPGHOME_DIAG
+  return 0 2>/dev/null || true
+}
 
 # Desktop reconstruction verification (requires actual camera scan of printed QR)
 echo ">>> Scan the printed QR code with zbarcam..."
@@ -206,10 +249,10 @@ echo ""
 
 if ! command -v zbarcam >/dev/null; then
   echo "❌ zbarcam not found - skipping scan test"
-  echo ">>> Cleanup and exit..."
+  echo ">>> Cleanup..."
   rm -rf "$GNUPGHOME_DIAG"
   unset GNUPGHOME_DIAG
-  exit 0
+  return 0 2>/dev/null || true
 fi
 
 echo "Press Enter to start zbarcam, or Ctrl+C to skip..."
@@ -232,7 +275,7 @@ else
   echo "❌ WARNING: No data captured from scan"
   rm -rf "$GNUPGHOME_DIAG" "$GNUPGHOME_REBUILD"
   unset GNUPGHOME_DIAG GNUPGHOME_REBUILD
-  exit 1
+  return 1 2>/dev/null || true
 fi
 
 # Rebuild the key from scanned paperkey output (using separate directory)
@@ -437,11 +480,11 @@ ls -lh master_secret.gpg revocation_cert.asc master_paperkey.txt master_checksum
 ~~~bash
 echo ">>> Printing Paper Backups (QR Codes + ASCII)..."
 
-lp checksum_qr.png
-lp revocation_qr.png
-lp master_checksum.txt
-lp revocation_cert.asc
-lp master_paperkey.txt
+print_file checksum_qr.png "checksum QR code" || exit 1
+print_file revocation_qr.png "revocation QR code" || exit 1
+print_file master_checksum.txt "master checksum" || exit 1
+print_file revocation_cert.asc "revocation certificate" || exit 1
+print_file master_paperkey.txt "master paperkey" || exit 1
 
 echo "✅ Paper backups printed. Store securely."
 ~~~
@@ -635,10 +678,10 @@ cat master_paperkey.txt | qrencode -l M -o master_qr.png
 cat master_checksum.txt | qrencode -l M -o checksum_qr.png
 
 echo ">>> Printing Master Key Artifacts..."
-lp master_qr.png
-lp master_paperkey.txt
-lp checksum_qr.png
-lp master_checksum.txt
+print_file master_qr.png "master QR code" || exit 1
+print_file master_paperkey.txt "master paperkey" || exit 1
+print_file checksum_qr.png "checksum QR code" || exit 1
+print_file master_checksum.txt "master checksum" || exit 1
 
 echo ">>> VERIFICATION: Scan the printed Master QR code now."
 echo "    Position printed QR code in front of camera..."
