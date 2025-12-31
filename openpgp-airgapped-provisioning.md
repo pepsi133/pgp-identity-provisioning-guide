@@ -61,8 +61,9 @@ export MY_EMAIL="testin@test.tst"
 export MY_EMAIL_2="secondary@test.tst"   # optional
 
 # --- STORAGE PATHS (confirm with lsblk/df -h) ---
-export USB_BACKUP_PATH="/media/debian/usb_backup"
-export SSD_BACKUP_PATH="/media/debian/ssd_backup"
+# Note: Debian Live typically mounts USB drives at /media/user/<disk label>
+export USB_BACKUP_PATH="/media/user/usb_backup"
+export SSD_BACKUP_PATH="/media/user/ssd_backup"
 
 # --- SYSTEM CONSTANTS (do not change) ---
 export GNUPGHOME=/tmp/tmp.gnupg_dpa_tmp
@@ -125,18 +126,14 @@ sudo apt-get install -f -y  # Fix any missing dependencies
 
 5. **Verify Tools**:
 ~~~bash
-REQUIRED_TOOLS=("gpg" "paperkey" "qrencode" "zbarimg" "zbarcam" "shuf" "sha256sum" "ykman" "lp" "rngd")
-for tool in "${REQUIRED_TOOLS[@]}"; do
-  command -v "$tool" >/dev/null && echo "  ✅ $tool" || echo "  ❌ $tool (missing)"
-done
-~~~
-
 echo ">>> Starting pcscd service..."
 sudo systemctl unmask pcscd || true
 sudo systemctl start pcscd || true
 
-# Final verification
+# Verify all required tools
+REQUIRED_TOOLS=("gpg" "paperkey" "qrencode" "zbarimg" "zbarcam" "shuf" "sha256sum" "ykman" "lp")
 MISSING_COUNT=0
+
 for tool in "${REQUIRED_TOOLS[@]}"; do
   if command -v "$tool" >/dev/null; then
     echo "  ✅ $tool"
@@ -144,6 +141,14 @@ for tool in "${REQUIRED_TOOLS[@]}"; do
     echo "  ❌ $tool (missing)"; MISSING_COUNT=$((MISSING_COUNT + 1))
   fi
 done
+
+# Check rngd separately (may be in /usr/sbin)
+if command -v rngd >/dev/null || [ -x /usr/sbin/rngd ]; then
+  echo "  ✅ rngd"
+else
+  echo "  ❌ rngd (missing)"; MISSING_COUNT=$((MISSING_COUNT + 1))
+fi
+
 [ $MISSING_COUNT -gt 0 ] && echo "⚠️  $MISSING_COUNT tool(s) missing. Install manually: sudo apt-get install -y <package>" || echo "✅ All tools available."
 ~~~
 
@@ -169,6 +174,7 @@ sudo dpkg -i *.deb || { echo "⚠️ dpkg reported errors; attempting apt-get -f
 **Step 0.3: Printer Setup (Network Required)**
 
 * Add the USB printer via Settings → Printers while online so CUPS pulls dependencies.
+* Set the printer as default (right-click in the GUI or use the dropdown menu).
 * Print a test page before disconnecting.
 
 **Step 0.4 (Optional but Recommended, Network OK): Diagnostic QR Test (Dummy Loopback)**
@@ -190,14 +196,58 @@ cat "$GNUPGHOME_DIAG/dummy_paperkey.txt" | qrencode -l M -o "$GNUPGHOME_DIAG/dum
 # Print and scan to mobile (OpenKeychain or similar) to confirm end-to-end
 lp "$GNUPGHOME_DIAG/dummy_qr.png"
 
-# Desktop reconstruction sanity check (requires an actual camera scan for full test)
-command -v zbarcam >/dev/null && echo "✅ zbarcam available" || echo "❌ zbarcam not found"
-paperkey --pubring <(gpg --homedir "$GNUPGHOME_DIAG" --export "$DUMMY_KEYID") --secrets "$GNUPGHOME_DIAG/dummy_paperkey.txt" --output "$GNUPGHOME_DIAG/dummy_rebuild.gpg"
-sha256sum "$GNUPGHOME_DIAG/dummy_secret.gpg" "$GNUPGHOME_DIAG/dummy_rebuild.gpg"
+# Desktop reconstruction verification (requires actual camera scan of printed QR)
+echo ">>> Scan the printed QR code with zbarcam..."
+echo "    - zbarcam GUI will open with camera feed"
+echo "    - Hold printed QR code to camera until scan completes"
+echo "    - GUI will close automatically after successful scan"
+echo "    - You'll see the scanned data below"
+echo ""
 
-# Cleanup
-rm -rf "$GNUPGHOME_DIAG"
-unset GNUPGHOME_DIAG
+if ! command -v zbarcam >/dev/null; then
+  echo "❌ zbarcam not found - skipping scan test"
+  echo ">>> Cleanup and exit..."
+  rm -rf "$GNUPGHOME_DIAG"
+  unset GNUPGHOME_DIAG
+  exit 0
+fi
+
+echo "Press Enter to start zbarcam, or Ctrl+C to skip..."
+read
+
+# Create separate temp directory for rebuild verification
+export GNUPGHOME_REBUILD=/tmp/tmp.gnupg_rebuild
+mkdir -p "$GNUPGHOME_REBUILD"
+
+# Scan the printed QR code
+zbarcam --raw > "$GNUPGHOME_REBUILD/scanned_paperkey.txt"
+
+SCAN_SIZE=$(wc -c < "$GNUPGHOME_REBUILD/scanned_paperkey.txt")
+if [ "$SCAN_SIZE" -gt 0 ]; then
+  echo "✅ Scan captured $SCAN_SIZE bytes"
+  echo "First 100 characters of scanned data:"
+  head -c 100 "$GNUPGHOME_REBUILD/scanned_paperkey.txt"
+  echo ""
+else
+  echo "❌ WARNING: No data captured from scan"
+  rm -rf "$GNUPGHOME_DIAG" "$GNUPGHOME_REBUILD"
+  unset GNUPGHOME_DIAG GNUPGHOME_REBUILD
+  exit 1
+fi
+
+# Rebuild the key from scanned paperkey output (using separate directory)
+paperkey --pubring <(gpg --homedir "$GNUPGHOME_DIAG" --export "$DUMMY_KEYID") --secrets "$GNUPGHOME_REBUILD/scanned_paperkey.txt" --output "$GNUPGHOME_REBUILD/dummy_rebuild.gpg"
+
+# Compare hashes
+HASH_ORIG=$(sha256sum "$GNUPGHOME_DIAG/dummy_secret.gpg" | awk '{print $1}')
+HASH_REBUILD=$(sha256sum "$GNUPGHOME_REBUILD/dummy_rebuild.gpg" | awk '{print $1}')
+echo "Original:  $HASH_ORIG"
+echo "Rebuilt:   $HASH_REBUILD"
+[ "$HASH_ORIG" == "$HASH_REBUILD" ] && echo "✅ Paperkey reconstruction verified" || echo "❌ WARNING: Hashes don't match"
+
+# Cleanup both directories
+rm -rf "$GNUPGHOME_DIAG" "$GNUPGHOME_REBUILD"
+unset GNUPGHOME_DIAG GNUPGHOME_REBUILD
 ~~~
 
 If the dummy key fails to round-trip on mobile or desktop, fix scanning/printing before proceeding.
@@ -400,20 +450,37 @@ echo "✅ Paper backups printed. Store securely."
 
 ~~~bash
 echo ">>> TEST 1/2: Scan the CHECKSUM QR code"
-zbarcam --raw > scanned_checksum.txt 2>/dev/null
+echo "    Position printed QR code in front of camera..."
+zbarcam --raw > scanned_checksum.txt
+
+SCAN_SIZE=$(wc -c < scanned_checksum.txt)
+echo "Captured $SCAN_SIZE bytes"
+
 if diff -w master_checksum.txt scanned_checksum.txt >/dev/null 2>&1; then
   echo "✅ Checksum QR scan successful"
 else
   echo "❌ WARNING: Checksum QR scan failed or mismatch"
+  echo "Expected vs Scanned:"
+  diff master_checksum.txt scanned_checksum.txt || true
 fi
 rm -f scanned_checksum.txt
 
+echo ""
 echo ">>> TEST 2/2: Scan the REVOCATION CERTIFICATE QR code"
-zbarcam --raw > scanned_revocation.txt 2>/dev/null
+echo "    Position printed QR code in front of camera..."
+zbarcam --raw > scanned_revocation.txt
+
+SCAN_SIZE=$(wc -c < scanned_revocation.txt)
+echo "Captured $SCAN_SIZE bytes"
+
 if diff -w revocation_cert.asc scanned_revocation.txt >/dev/null 2>&1; then
   echo "✅ Revocation Certificate QR scan successful"
 else
   echo "❌ WARNING: Revocation QR scan failed or mismatch"
+  echo "Expected vs Scanned (first 200 chars):"
+  head -c 200 revocation_cert.asc
+  echo ""
+  head -c 200 scanned_revocation.txt
 fi
 rm -f scanned_revocation.txt
 ~~~
@@ -574,9 +641,21 @@ lp checksum_qr.png
 lp master_checksum.txt
 
 echo ">>> VERIFICATION: Scan the printed Master QR code now."
+echo "    Position printed QR code in front of camera..."
 zbarcam --raw | tee scanned_output.txt
 
-diff -w master_paperkey.txt scanned_output.txt >/dev/null && echo "✅ PHYSICAL BACKUP VERIFIED: Printed QR matches digital file." || echo "❌ FAILURE: Printed QR does not match."
+SCAN_SIZE=$(wc -c < scanned_output.txt)
+echo "Captured $SCAN_SIZE bytes"
+
+if diff -w master_paperkey.txt scanned_output.txt >/dev/null 2>&1; then
+  echo "✅ PHYSICAL BACKUP VERIFIED: Printed QR matches digital file."
+else
+  echo "❌ FAILURE: Printed QR does not match."
+  echo "Expected vs Scanned (first 200 chars):"
+  head -c 200 master_paperkey.txt
+  echo ""
+  head -c 200 scanned_output.txt
+fi
 
 cp master_secret.gpg "$USB_BACKUP_PATH/$BACKUP_DIR_NAME/"
 cp master_checksum.txt "$USB_BACKUP_PATH/$BACKUP_DIR_NAME/"
@@ -822,7 +901,17 @@ gpg --edit-key "$KEYID"
 **Reconstruction:**
 
 ~~~bash
+echo ">>> Scan the printed paperkey QR code..."
+echo "    Position printed QR code in front of camera..."
 zbarcam --raw > scanned_paperkey.txt   # or type manually
+
+SCAN_SIZE=$(wc -c < scanned_paperkey.txt)
+if [ "$SCAN_SIZE" -gt 0 ]; then
+  echo "✅ Scan captured $SCAN_SIZE bytes"
+else
+  echo "❌ WARNING: No data captured. You may need to type the paperkey manually."
+fi
+
 paperkey --pubring public_key_bundle.asc --secrets scanned_paperkey.txt --output restored_master.gpg
 gpg --import restored_master.gpg
 ~~~
