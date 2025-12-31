@@ -15,26 +15,18 @@ Create a script named `prep_usb.sh` to download the ISO and all offline dependen
 #!/bin/bash
 # FAIL-FAST: Exit immediately if a command exits with a non-zero status
 set -e
+# KEEP TERMINAL OPEN: Pause on exit (success or failure) so user can read output
+trap 'echo "Press Enter to exit..."; read' EXIT
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
 # ISO & Validations
 ISO_URL="https://laotzu.ftp.acc.umu.se/debian-cd/current-live/amd64/iso-hybrid/"
-ISO_NAME="debian-live-13.2.0-amd64-gnome.iso"
 CHECKSUM_FILE="SHA512SUMS"
 
 # Directory for all offline assets
 PGP_LIVE_ASSETS_DIR="./pgp_live_assets"
-
-# Printer Support Selection (Set to "true" to include)
-INCLUDE_IPP_USB="true"  # Modern Driverless (AirPrint/IPP-Everywhere) - RECOMMENDED
-INCLUDE_BROTHER="true"  # Legacy Brother DCP-J725DW (requires 32-bit libs)
-INCLUDE_HP="false"      # HP Printers (HPLIP)
-INCLUDE_GENERIC="true"  # Universal metapackage (Canon, Epson, etc.)
-
-# Base Toolset (Required)
-BASE_PACKAGES="qrencode zbar-tools paperkey pcscd scdaemon setup-config-printer rng-tools-debian"
 
 # ==========================================
 
@@ -43,43 +35,24 @@ echo "[+] Setting up assets directory at: $PGP_LIVE_ASSETS_DIR"
 mkdir -p "$PGP_LIVE_ASSETS_DIR" 
 cd "$PGP_LIVE_ASSETS_DIR"
 
-# 2. DOWNLOAD ISO & HASHES
-echo "[+] Fetching Debian 13 Image..."
+# 2. RESOLVE & DOWNLOAD ISO
+echo "[+] Querying $ISO_URL for latest GNOME image..."
+# Dynamically fetch the latest version matching the pattern
+ISO_NAME=$(curl -sL "$ISO_URL" | grep -oP 'debian-live-\d+\.\d+\.\d+-amd64-gnome\.iso' | head -1)
+
+if [ -z "$ISO_NAME" ]; then
+    echo "❌ ERROR: Could not resolve ISO filename from $ISO_URL"
+    exit 1
+fi
+echo "[+] Latest Version Found: $ISO_NAME"
+
+echo "[+] Fetching Image..."
 wget -c "${ISO_URL}${ISO_NAME}"
-wget "${ISO_URL}${CHECKSUM_FILE}"
+wget -O "${CHECKSUM_FILE}" "${ISO_URL}${CHECKSUM_FILE}"
 
 # 3. INTEGRITY CHECK
 echo "[+] Verifying Integrity..."
-grep "$ISO_NAME" "$CHECKSUM_FILE" | sha512sum -c -
-
-# 4. DOWNLOAD PACKAGES
-echo "[+] Downloading Base Toolset..."
-apt-get download $BASE_PACKAGES
-
-if [ "$INCLUDE_GENERIC" = "true" ]; then
-    echo "[+] Downloading Generic Printer Drivers..."
-    apt-get download printer-driver-all printer-driver-gutenprint
-fi
-
-if [ "$INCLUDE_IPP_USB" = "true" ]; then
-    echo "[+] Downloading IPP-USB (Driverless)..."
-    apt-get download ipp-usb
-fi
-
-if [ "$INCLUDE_HP" = "true" ]; then
-    echo "[+] Downloading HP Printer Drivers (HPLIP)..."
-    apt-get download hplip printer-driver-hpcups
-fi
-
-# 5. BROTHER LEGACY DRIVERS
-if [ "$INCLUDE_BROTHER" = "true" ]; then
-    echo "[+] Fetching Brother DCP-J725DW Drivers & 32-bit libs..."
-    # 32-bit lib info: lib32stdc++6 is often needed for older Brother drivers
-    apt-get download lib32stdc++6 printer-driver-brlaser
-    
-    wget "https://download.brother.com/welcome/dlf006159/dcpj725dwlpr-3.0.1-1.i386.deb"
-    wget "https://download.brother.com/welcome/dlf006161/dcpj725dwcupswrapper-3.0.0-1.i386.deb"
-fi
+grep -P "\s$ISO_NAME$" "$CHECKSUM_FILE" | sha512sum -c -
 
 echo "[✓] Preparation Complete. Assets ready in: $PGP_LIVE_ASSETS_DIR"
 ```
@@ -91,24 +64,23 @@ echo "[✓] Preparation Complete. Assets ready in: $PGP_LIVE_ASSETS_DIR"
 ### Option A: Windows Native (Rufus)
 1. **Tool:** Open [Rufus](https://rufus.ie/).
 2. **Device:** Select your **USB Flash Drive**.
-3. **Boot Selection:** Select the downloaded **debian-live-13.2.0-amd64-gnome.iso**.
+3. **Boot Selection:** Select the downloaded **debian-live-*-amd64-gnome.iso**.
 4. **Flash Mode:** Click **START**. When the "ISOHybrid" prompt appears, **YOU MUST SELECT "Write in DD Image mode"**.
 5. **Payload:** Once finished, copy the **pgp_live_assets** folder to the root of a second USB drive (or a separate partition if you are an advanced user).
 
-### Option B: WSL 2 Native (usbipd-win)
-1. **PowerShell (Admin):**
-   ```powershell
-   usbipd list
-   # Replace <BUSID> with the ID from the list (e.g., 2-1)
-   usbipd attach --wsl --busid <BUSID>
-   ```
-2. **WSL Terminal:**
-   ```bash
-   # Identify USB (check size to confirm, e.g., /dev/sdX)
-   lsblk
-   # Perform Native DD
-   sudo dd if=debian-live-13.2.0-amd64-gnome.iso of=/dev/sdX bs=4M status=progress conv=fsync oflag=direct
-   ```
+### Option B: Linux Native (Advanced)
+If you are on a native Linux host (not WSL), you can write the image directly.
+
+1.  **Identify USB Device:**
+    ```bash
+    lsblk
+    # Identify your USB drive letter (e.g., /dev/sdX). Do NOT use the wrong drive!
+    ```
+2.  **Write Image:**
+    ```bash
+    # Replace /dev/sdX with your actual USB device
+    sudo dd if=debian-live-*-amd64-gnome.iso of=/dev/sdX bs=4M status=progress conv=fsync oflag=direct
+    ```
 
 ---
 
@@ -123,10 +95,15 @@ Once the desktop loads, open a terminal:
 # 1. Identify USB Device (e.g., /dev/sda)
 lsblk
 
-# 2. Create Persistence Partition in the remaining space
-# We start at 4GB to avoid overwriting the ISO system partitions
-sudo parted /dev/sda mkpart primary ext4 4GB 100%
-sudo mkfs.ext4 -L persistence /dev/sda2
+# 2. visual Partitioning (Robust)
+# Run cfdisk: Select 'Free Space' -> 'New' -> 'Write' -> 'Quit'
+sudo cfdisk /dev/sda
+
+# 3. Format the New Partition
+# Check lsblk again to find the new partition (e.g., sda3)
+lsblk
+# Replace /dev/sda3 below with your actual new partition name
+sudo mkfs.ext4 -L persistence /dev/sda3
 
 # 3. Configure Persistence (Packages Only)
 sudo mkdir -p /mnt/persist
@@ -147,45 +124,12 @@ sudo umount /mnt/persist
 
 ---
 
-## Phase 4: Offline Hardening & Toolchain Installation
-
-**Ensure all Networking hardware is physically disabled or blocked in BIOS.**
-
-### 4.1 Driver & Tool Installation
-Run these commands to prepare the environment.
-
-**Strategy:**
-1.  **Install Base Tools & IPP-USB first.** Try printing.
-2.  **Only if that fails:** Install the legacy drivers (requires enabling 32-bit architecture).
-
-```bash
-# 1. Install Base Tools & Driverless Support
-cd /lib/live/mount/persistence/*/pgp_live_assets
-sudo dpkg -i ipp-usb*.deb 2>/dev/null || true
-sudo dpkg -i qrencode*.deb zbar-tools*.deb paperkey*.deb pcscd*.deb scdaemon*.deb setup-config-printer*.deb rng-tools*.deb
-sudo apt install -f # Fix dependencies
-
-# 2. Check if Printer works (Driverless)
-# Connect USB. If using ipp-usb, the printer appears as a Network Printer (localhost).
-# SYSTEM SETTINGS -> PRINTERS -> ADD -> Network Printer
-
-# ==========================================================
-# OPTIONAL: Legacy 32-bit Brother Drivers (Fallback Only)
-# Use this ONLY if ipp-usb does not work for your specific model.
-# ==========================================================
-# sudo dpkg --add-architecture i386
-# sudo apt update
-# sudo dpkg -i lib32stdc++6*.deb printer-driver-brlaser*.deb
-# sudo dpkg -i dcpj725dw*.deb
-# sudo apt install -f
-```
-
-### 4.2 Entropy Priming
-```bash
-# Saturate the kernel entropy pool for high-quality key generation
-sudo rngd -r /dev/urandom
-# Manually move the mouse and mash the keyboard for 60 seconds.
-```
+## Phase 4: Ready for Provisioning
+The USB is now ready. 
+1. Boot the target laptop.
+2. Select "Debian Live with Persistence".
+3. Proceed immediately to the **Main Provisioning Protocol** document (`openpgp-airgapped-provisioning.md`).
+   - You will perform the "System Preparation (Online)" step there to install tools and drivers.
 
 ---
 

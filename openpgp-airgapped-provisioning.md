@@ -83,35 +83,53 @@ echo "✅ Session variables saved to: $GNUPGHOME/session_vars.sh"
 echo "   To recover after interruption: source $GNUPGHOME/session_vars.sh"
 ~~~
 
-**Step 0.2: Pre-Flight Tool Check (Debian Stable Main repos)**
+**Step 0.2: System Preparation (Online)**
+ 
+Goal: Install necessary tools while temporarily connected to the internet. This replaces the offline bundle method.
 
-All tooling should come from Debian Main. Packages: **gnupg paperkey qrencode zbar-tools coreutils yubikey-manager wamerican scdaemon pcscd cups-client rng-tools**.
-
+1. **Connect to Network**: Temporarily enable Wi-Fi or Ethernet.
+2. **Update Repositories**:
 ~~~bash
-REQUIRED_TOOLS=("gpg" "paperkey" "qrencode" "zbarimg" "zbarcam" "shuf" "sha256sum" "ykman" "lp")
-PACKAGES="gnupg paperkey qrencode zbar-tools coreutils yubikey-manager wamerican scdaemon pcscd cups-client rng-tools"
+sudo apt-get update
+~~~
 
-echo ">>> Initial Tool Check..."
+3. **Install Base Tools**:
+   Note: `rng-tools5` replaces the older `rng-tools`.
+~~~bash
+PACKAGES="gnupg paperkey qrencode zbar-tools coreutils yubikey-manager wamerican scdaemon pcscd cups-client rng-tools5 system-config-printer ipp-usb"
+sudo apt-get install -y $PACKAGES
+~~~
+
+4. **Install Printer Drivers (Optional)**:
+
+   **A) Driverless (Recommended for Modern Printers):**
+   IPP-USB is installed above. Try adding your printer in Settings → Printers first.
+
+   **B) Legacy Brother DCP-J725DW (Fallback):**
+   Requires enabling 32-bit architecture.
+~~~bash
+# Enable 32-bit architecture
+sudo dpkg --add-architecture i386
+sudo apt-get update
+
+# Install 32-bit dependencies
+sudo apt-get install -y lib32stdc++6 printer-driver-brlaser
+
+# Download & Install Legacy Drivers (Direct from Brother)
+mkdir -p /tmp/brother_drivers && cd /tmp/brother_drivers
+wget "https://download.brother.com/pub/com/linux/linux/dlf/dcpj725dwlpr-3.0.1-1.i386.deb"
+wget "https://download.brother.com/pub/com/linux/linux/dlf/dcpj725dwcupswrapper-3.0.0-1.i386.deb"
+sudo dpkg -i *.deb
+sudo apt-get install -f -y  # Fix any missing dependencies
+~~~
+
+5. **Verify Tools**:
+~~~bash
+REQUIRED_TOOLS=("gpg" "paperkey" "qrencode" "zbarimg" "zbarcam" "shuf" "sha256sum" "ykman" "lp" "rngd")
 for tool in "${REQUIRED_TOOLS[@]}"; do
   command -v "$tool" >/dev/null && echo "  ✅ $tool" || echo "  ❌ $tool (missing)"
 done
-
-echo ">>> Checking Internet Connectivity..."
-if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
-  echo "✅ Internet connected."; NETWORK_OK=1
-else
-  echo "❌ No internet. Skipping installation."; NETWORK_OK=0
-fi
-
-echo ""
-if [ $NETWORK_OK -eq 1 ]; then
-  echo ">>> Updating Debian Main repos..."
-  sudo apt-get update || true
-  echo ""
-  echo ">>> Installing packages..."
-  sudo apt-get install -y $PACKAGES || sudo apt-get install -y --fix-missing $PACKAGES || true
-  echo ""
-fi
+~~~
 
 echo ">>> Starting pcscd service..."
 sudo systemctl unmask pcscd || true
